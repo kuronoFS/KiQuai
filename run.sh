@@ -1,11 +1,14 @@
 #!/bin/bash
 # ============================================================================
-#  Pearl (PRL) Miner Launcher — rgminer (repo: Printscan/rgminer)
+#  Pearl (PRL) Miner Launcher — SRBMiner-Multi (repo: doktor83/SRBMiner-Multi)
+#  Pool mặc định: LuckyPool Asia (pearl-sg1.luckypool.io, Singapore)
 # ----------------------------------------------------------------------------
-#  - Tự tải, kiểm định (ELF/arch/sha256) và chạy rgminer, log debug từng bước.
+#  - Tự tải, kiểm định (MD5/ELF/arch) và chạy SRBMiner-MULTI, log từng bước.
+#  - GPU chạy STOCK — script KHÔNG can thiệp clock/power limit (ưu tiên ổn
+#    định, nhiệt độ). Bảo vệ nhiệt qua --gpu-off-temperature (mặc định 90°C).
 #  - Mọi biến cấu hình đều override được bằng biến môi trường khi chạy:
 #       WALLET=prl1... WORKER=rig02 DEBUG=0 ./run.sh
-#       curl -fsSL <url>/run.sh | MINING_MODE=GPU bash
+#       curl -fsSL <url>/run.sh | WORKER=rig02 bash
 #  - QUAN TRỌNG: mỗi lần sửa file này, hãy TĂNG SCRIPT_VERSION bên dưới
 #    để khi xem log biết chính xác đang chạy bản code cũ hay mới.
 # ============================================================================
@@ -15,55 +18,71 @@ set -E   # Cho phép ERR trap hoạt động bên trong function
 # ----------------------------------------------------------------------------
 # [PHIÊN BẢN SCRIPT] — tăng số này mỗi lần chỉnh sửa code
 # ----------------------------------------------------------------------------
-SCRIPT_VERSION="2.2.0"
+SCRIPT_VERSION="3.0.0"
 SCRIPT_BUILD_DATE="2026-06-12"
 # CHANGELOG:
-#  2.2.0: KẾ HOẠCH B cho lỗi exec "câm" của launcher: tự tìm backend đã giải
-#         nén trong cache và chạy TRỰC TIẾP (LD_LIBRARY_PATH trỏ vào cache để
-#         nạp libssl đi kèm) — bỏ qua hẳn launcher; thêm chẩn đoán strace tự
-#         động (nếu có) để chỉ ra chính xác syscall exec bị lỗi.
-#  2.1.0: rgminer là launcher tự giải nén backend vào cache => xử lý Code=126
-#         "câm": quản lý cache (RGMINER_BUNDLE_CACHE), probe quyền exec, tự xoá
-#         cache hỏng + thử lại; kiểm tra driver cho RTX 50xx (cần >= 595.58.03);
-#         tự chọn RGMINER_BACKEND (cuda12/cuda13) như h-run.sh chính chủ.
-#  2.0.0: viết lại toàn bộ: log 7 bước, kiểm định binary, chẩn đoán exit code.
+#  3.0.0: CHUYỂN HẲN sang SRBMiner-Multi 3.3.7 (thuật toán 'pearlhash') +
+#         LuckyPool Asia (pearl-sg1.luckypool.io, failover sg2/eu2).
+#         Tự chọn port 3360/3361/3362 theo tổng hashrate ước tính (số GPU ×
+#         GPU_TH_EST). GPU chạy STOCK — không OC. API giám sát cổng 21550.
+#         Bỏ toàn bộ logic launcher/cache/Plan B của rgminer và mode CPU/DUAL.
+#  2.x  : các bản dùng rgminer + rplant (đã ngừng dùng).
 
 # ----------------------------------------------------------------------------
 # [CẤU HÌNH ĐÀO]
 # ----------------------------------------------------------------------------
-MINING_MODE="${MINING_MODE:-GPU}"   # GPU | CPU | DUAL
 WALLET="${WALLET:-prllp6l40ns5k4afu7whzgzmmr9jlczuf2n8s96jaej98rfvhzvus35tsz65jk4}"
 WORKER="${WORKER:-rig01}"
-POOL="${POOL:-asia.rplant.xyz:17168}"
-ALGO="${ALGO:-pearl}"
-EXTRA_ARGS="${EXTRA_ARGS:-}"        # Tham số thêm cho rgminer, vd: "--pearl-protocol akoya"
+ALGO="${ALGO:-pearlhash}"
+
+# POOL để TRỐNG = script tự ghép POOL_HOST + các host failover với port tự
+# chọn theo hashrate ước tính (xem BƯỚC 4). Muốn chỉ định cứng thì đặt:
+#   POOL="pearl-sg1.luckypool.io:3360"  (nhiều pool phân cách bằng dấu phẩy)
+POOL="${POOL:-}"
+POOL_HOST="${POOL_HOST:-pearl-sg1.luckypool.io}"
+POOL_FAILOVER_HOSTS="${POOL_FAILOVER_HOSTS:-pearl-sg2.luckypool.io pearl-eu2.luckypool.io}"
+# Ước tính TH/s mỗi GPU để chọn port LuckyPool (RTX 5090 stock ~344-400 TH/s).
+# Port chỉ khác nhau ở độ khó khởi điểm (vardiff tự điều chỉnh sau đó):
+#   3360: < 500 TH/s | 3361: 500-1000 TH/s | 3362: > 1000 TH/s
+GPU_TH_EST="${GPU_TH_EST:-350}"
+EXTRA_ARGS="${EXTRA_ARGS:-}"        # Tham số thêm cho SRBMiner, vd: "--tls true"
 
 # ----------------------------------------------------------------------------
-# [CẤU HÌNH MINER] — rgminer chính chủ tại https://github.com/Printscan/rgminer
-# (LƯU Ý: repo cũ rplant8/rgminer KHÔNG tồn tại — đây là nguyên nhân lỗi trước)
+# [GIÁM SÁT / AN TOÀN] — tính năng có sẵn của SRBMiner, không phải OC
 # ----------------------------------------------------------------------------
-RGMINER_VERSION="${RGMINER_VERSION:-latest}"   # "latest" hoặc tag cụ thể, vd "v0.9.4"
-INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
-FORCE_REINSTALL="${FORCE_REINSTALL:-0}"        # 1 = xoá binary cũ và tải lại từ đầu
-EXPECTED_SHA256="${EXPECTED_SHA256:-}"         # Để trống = không so khớp checksum
+API_ENABLE="${API_ENABLE:-1}"            # 1 = bật API thống kê (http://<host>:API_PORT/stats)
+API_PORT="${API_PORT:-21550}"
+GPU_OFF_TEMP="${GPU_OFF_TEMP:-90}"       # GPU vượt N°C => miner tự tắt GPU đó (0 = tắt tính năng)
+NO_SHARE_RESTART="${NO_SHARE_RESTART:-900}"  # Giây không có share được chấp nhận => miner tự restart (0 = tắt)
 
-# rgminer là LAUNCHER: lúc chạy nó tự giải nén backend (rgminer.cuda12/cuda13)
-# vào thư mục cache rồi exec. Cache hỏng / bị chặn exec => Code=126 không log.
-RGMINER_BACKEND="${RGMINER_BACKEND:-}"         # trống = tự chọn | cuda12 | cuda13 | auto
-RGMINER_BUNDLE_CACHE="${RGMINER_BUNDLE_CACHE:-/usr/local/lib/rgminer-cache}"
-MIN_CUDA13_DRIVER="595.58.03"                  # driver tối thiểu cho backend CUDA 13 (RTX 50xx)
+# ----------------------------------------------------------------------------
+# [CẤU HÌNH MINER] — SRBMiner-Multi chính chủ: github.com/doktor83/SRBMiner-Multi
+# ----------------------------------------------------------------------------
+SRB_VERSION="${SRB_VERSION:-3.3.7}"
+INSTALL_DIR="${INSTALL_DIR:-/usr/local/lib/srbminer}"
+FORCE_REINSTALL="${FORCE_REINSTALL:-0}"  # 1 = xoá bản cài cũ và tải lại từ đầu
+EXPECTED_MD5="${EXPECTED_MD5:-}"         # Để trống = tự áp MD5 chính chủ nếu biết version
 
-if [ "$RGMINER_VERSION" = "latest" ]; then
-    URL_DEFAULT="https://github.com/Printscan/rgminer/releases/latest/download/rgminer"
-else
-    URL_DEFAULT="https://github.com/Printscan/rgminer/releases/download/${RGMINER_VERSION}/rgminer"
+# MD5 chính chủ công bố trên trang release — chỉ tự áp khi version khớp
+if [ -z "$EXPECTED_MD5" ]; then
+    case "$SRB_VERSION" in
+        3.3.7) EXPECTED_MD5="8862183218550e39b0571d0716fadc8e" ;;
+    esac
 fi
-URL_DOWNLOAD="${URL_DOWNLOAD:-$URL_DEFAULT}"   # Hỗ trợ cả link .tar.gz nếu cần
+
+SRB_VER_DASH=${SRB_VERSION//./-}
+URL_DEFAULT="https://github.com/doktor83/SRBMiner-Multi/releases/download/${SRB_VERSION}/SRBMiner-Multi-${SRB_VER_DASH}-Linux.tar.gz"
+URL_DOWNLOAD="${URL_DOWNLOAD:-$URL_DEFAULT}"
+
+# Driver NVIDIA khuyến nghị cho 'pearlhash' (ghi chú chính thức của SRBMiner);
+# RTX 50xx (Blackwell) tối thiểu cần driver nhánh 570.
+RECOMMENDED_DRIVER="580"
+MIN_BLACKWELL_DRIVER="570"
 
 # ----------------------------------------------------------------------------
 # [CẤU HÌNH DEBUG / RESTART]
 # ----------------------------------------------------------------------------
-DEBUG="${DEBUG:-1}"                            # 1 = hiện log [DEBUG] chi tiết, 0 = gọn
+DEBUG="${DEBUG:-1}"                            # 1 = hiện log [DEBUG] chi tiết + --extended-log
 RESTART_DELAY="${RESTART_DELAY:-5}"            # Giây chờ giữa các lần restart
 LONG_RESTART_DELAY="${LONG_RESTART_DELAY:-60}" # Giây chờ khi crash liên tục
 MAX_RETRIES="${MAX_RETRIES:-0}"                # Tổng số lần chạy tối đa, 0 = vô hạn
@@ -71,14 +90,13 @@ MIN_UPTIME="${MIN_UPTIME:-20}"                 # Chạy dưới N giây => tính
 FAST_FAIL_LIMIT="${FAST_FAIL_LIMIT:-5}"        # N lần crash nhanh liên tiếp => chẩn đoán sâu
 
 TOTAL_STEPS=7
-BIN_PATH="$INSTALL_DIR/rgminer"
-CPU_LOG="/tmp/rgminer-cpu.log"
+VERSION_FILE="$INSTALL_DIR/.installed_version"
 TMP_DIR=""
-CPU_PID=""
 MINER_PID=""
-MINER_EXEC_MODE="launcher"   # launcher = chạy qua rgminer | direct = chạy thẳng backend
-BACKEND_DIR=""
-BACKEND_BIN=""
+BIN_PATH=""        # xác định ở BƯỚC 5 (sau khi cài/tìm thấy binary)
+BIN_DIR=""
+POOL_LIST=""       # xác định ở BƯỚC 4 (sau khi đếm GPU)
+GPU_COUNT=0
 
 # ============================================================================
 #  HÀM LOG — mọi dòng đều có timestamp + cấp độ để dễ truy vết
@@ -113,7 +131,6 @@ on_signal() {
     echo
     log_warn "Nhận tín hiệu dừng (Ctrl+C / docker stop) — đang tắt miner sạch sẽ..."
     if [ -n "$MINER_PID" ]; then kill "$MINER_PID" 2>/dev/null || true; fi
-    if [ -n "$CPU_PID" ];   then kill "$CPU_PID"   2>/dev/null || true; fi
     wait 2>/dev/null || true
     log_warn "Đã dừng toàn bộ tiến trình đào."
     exit 130
@@ -147,106 +164,11 @@ elf_arch_of() {
     esac
 }
 
+md5_of()    { md5sum "$1" 2>/dev/null | awk '{print $1}'; }
 sha256_of() { sha256sum "$1" 2>/dev/null | awk '{print $1}'; }
 
 # So sánh version dạng a.b.c — version_ge A B nghĩa là A >= B
 version_ge() { [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)" = "$2" ]; }
-
-# ----------------------------------------------------------------------------
-# CACHE BACKEND: binary rgminer là launcher tự giải nén rgminer.cuda12/cuda13
-# vào cache (RGMINER_BUNDLE_CACHE > XDG_CACHE_HOME > ~/.cache/rgminer-dual >
-# /tmp) rồi exec. Nếu cache bị hỏng (giải nén dở dang do bị kill) hoặc thư mục
-# bị mount noexec thì launcher thoát Code=126 mà KHÔNG in lỗi nào.
-# ----------------------------------------------------------------------------
-
-# Kiểm tra 1 thư mục có cho phép GHI + THỰC THI file không (bắt noexec)
-exec_probe() {
-    local d=$1 probe="" src=""
-    probe="$d/.exec_probe.$$"
-    for src in /bin/true /usr/bin/true; do
-        if [ -x "$src" ]; then break; fi
-    done
-    if [ ! -x "$src" ]; then return 0; fi   # không có 'true' để thử => bỏ qua probe
-    cp "$src" "$probe" 2>/dev/null || return 1
-    chmod +x "$probe" 2>/dev/null || true
-    if "$probe" 2>/dev/null; then
-        rm -f "$probe" 2>/dev/null || true
-        return 0
-    fi
-    rm -f "$probe" 2>/dev/null || true
-    return 1
-}
-
-# Chọn thư mục cache đầu tiên cho phép ghi + exec, rồi export cho launcher
-prepare_bundle_cache() {
-    local d
-    for d in "$RGMINER_BUNDLE_CACHE" "${HOME:-/root}/.cache/rgminer-dual" "/var/tmp/rgminer-cache" "/tmp/rgminer-cache"; do
-        if [ -z "$d" ]; then continue; fi
-        if mkdir -p "$d" 2>/dev/null && [ -w "$d" ] && exec_probe "$d"; then
-            RGMINER_BUNDLE_CACHE="$d"
-            export RGMINER_BUNDLE_CACHE
-            log_info "Cache backend : $RGMINER_BUNDLE_CACHE (đã kiểm tra: ghi + thực thi OK)"
-            return 0
-        fi
-        log_warn "Thư mục cache '$d' không ghi/exec được (noexec?) — thử vị trí khác..."
-    done
-    die "Không tìm được thư mục nào cho phép GHI + THỰC THI để launcher giải nén backend rgminer!"
-}
-
-# Xoá sạch payload đã giải nén (kể cả cache mặc định cũ) để launcher làm lại từ đầu
-clean_bundle_cache() {
-    if [ -n "$RGMINER_BUNDLE_CACHE" ] && [ -d "$RGMINER_BUNDLE_CACHE" ]; then
-        log_info "🧹 Dọn cache backend: $RGMINER_BUNDLE_CACHE (launcher sẽ tự giải nén lại sạch sẽ)"
-        rm -rf "${RGMINER_BUNDLE_CACHE:?}"/* "${RGMINER_BUNDLE_CACHE:?}"/.[!.]* 2>/dev/null || true
-    fi
-    rm -rf "${HOME:-/root}/.cache/rgminer-dual" 2>/dev/null || true
-    rm -rf /tmp/rgminer-dual* 2>/dev/null || true
-}
-
-# Tìm backend đã được launcher giải nén sẵn trong cache (cho chế độ DIRECT).
-# Ưu tiên cuda13 trừ khi RGMINER_BACKEND=cuda12. Tìm cả cache cũ ~/.cache.
-locate_backend() {
-    BACKEND_DIR=""
-    BACKEND_BIN=""
-    local names=("rgminer.cuda13" "rgminer.cuda12")
-    if [ "${RGMINER_BACKEND:-}" = "cuda12" ]; then names=("rgminer.cuda12" "rgminer.cuda13"); fi
-    local base n f
-    for base in "$RGMINER_BUNDLE_CACHE" "${HOME:-/root}/.cache/rgminer-dual"; do
-        if [ ! -d "$base" ]; then continue; fi
-        for n in "${names[@]}"; do
-            f=$(find "$base" -maxdepth 2 -type f -name "$n" 2>/dev/null | head -n1)
-            if [ -n "$f" ] && is_elf "$f"; then
-                chmod +x "$f" 2>/dev/null || true
-                BACKEND_BIN="$f"
-                BACKEND_DIR=$(dirname "$f")
-                log_debug "Tìm thấy backend trong cache: $BACKEND_BIN ($(stat -c %s "$f" 2>/dev/null) bytes)"
-                return 0
-            fi
-        done
-    done
-    return 1
-}
-
-# In hiện trạng cache backend — gọi khi gặp Code=126 để biết hỏng chỗ nào
-dump_cache_info() {
-    hr
-    log_warn "CHẨN ĐOÁN CACHE BACKEND (RGMINER_BUNDLE_CACHE=$RGMINER_BUNDLE_CACHE):"
-    if [ -d "$RGMINER_BUNDLE_CACHE" ]; then
-        while IFS= read -r f; do
-            log_warn "   | $(ls -ld "$f" 2>/dev/null)"
-        done < <(find "$RGMINER_BUNDLE_CACHE" -maxdepth 2 2>/dev/null | head -15)
-        while IFS= read -r f; do
-            if is_elf "$f"; then
-                log_warn "   -> $(basename "$f"): $(stat -c %s "$f" 2>/dev/null) bytes — ELF hợp lệ"
-            else
-                log_warn "   -> $(basename "$f"): $(stat -c %s "$f" 2>/dev/null) bytes — HỎNG (không phải ELF — giải nén dở dang?)"
-            fi
-        done < <(find "$RGMINER_BUNDLE_CACHE" -maxdepth 2 -name 'rgminer.cuda*' -type f 2>/dev/null)
-    else
-        log_warn "   (thư mục cache chưa tồn tại — launcher sẽ tự tạo khi chạy)"
-    fi
-    hr
-}
 
 # In toàn bộ thông tin về 1 file để biết chính xác nó là gì / hỏng chỗ nào
 dump_file_info() {
@@ -260,14 +182,13 @@ dump_file_info() {
     fi
     log_warn "  -> ls -ld : $(ls -ld "$p" 2>&1)"
     if [ -d "$p" ]; then
-        log_warn "  -> Đây là THƯ MỤC, không phải file! (chạy thư mục => lỗi Code=126)"
-        log_warn "  -> Nội dung: $(ls -A "$p" 2>/dev/null | head -5 | tr '\n' ' ')"
+        log_warn "  -> Đây là THƯ MỤC, không phải file!"
         hr
         return 0
     fi
     log_warn "  -> Kích thước : $(stat -c %s "$p" 2>/dev/null || echo '?') bytes"
     log_warn "  -> Magic bytes: '$(magic_of "$p")' (ELF Linux chuẩn = '7f 45 4c 46')"
-    log_warn "  -> SHA256     : $(sha256_of "$p")"
+    log_warn "  -> MD5        : $(md5_of "$p")"
     if command -v file >/dev/null 2>&1; then
         log_warn "  -> file(1)    : $(file -b "$p" 2>&1)"
     fi
@@ -284,7 +205,7 @@ dump_file_info() {
             fi
         fi
     else
-        log_warn "  -> KHÔNG PHẢI binary ELF Linux => không thể thực thi (Code=126)."
+        log_warn "  -> KHÔNG PHẢI binary ELF Linux => không thể thực thi."
         log_warn "  -> Nội dung đầu file: $(head -c 200 "$p" 2>/dev/null | tr -cd '[:print:]' | head -c 150)"
     fi
     if [ ! -x "$p" ]; then
@@ -294,7 +215,7 @@ dump_file_info() {
     local mp
     mp=$(df -P "$p" 2>/dev/null | awk 'NR==2{print $6}') || true
     if [ -n "${mp:-}" ] && grep -E "[[:space:]]${mp}[[:space:]]" /proc/mounts 2>/dev/null | grep -q noexec; then
-        log_warn "  -> Phân vùng '$mp' bị mount NOEXEC => không cho chạy file (Code=126)!"
+        log_warn "  -> Phân vùng '$mp' bị mount NOEXEC => không cho chạy file!"
     fi
     hr
 }
@@ -303,15 +224,10 @@ dump_file_info() {
 explain_exit_code() {
     local code=$1
     case "$code" in
-        0)   log_warn "Code=0: miner tự thoát bình thường (bất thường với miner — có thể bị pool ngắt kết nối)." ;;
+        0)   log_warn "Code=0: miner tự thoát bình thường — thường do lỗi cấu hình được in ngay phía trên (sai wallet/pool/tham số) hoặc pool ngắt kết nối." ;;
         1)   log_error "Code=1: lỗi chung — thường do sai tham số, sai wallet/pool, hoặc pool từ chối. Đọc log miner ngay phía trên." ;;
         2)   log_error "Code=2: sai cú pháp tham số dòng lệnh." ;;
-        42)  log_error "Code=42: watchdog của rgminer phát hiện GPU CUDA failure (GPU treo/rớt khỏi bus) — kiểm tra driver, nhiệt độ, nguồn điện." ;;
-        126) log_error "Code=126: file TỒN TẠI nhưng KHÔNG THỂ THỰC THI."
-             log_error "  Với rgminer: đây thường là LAUNCHER không exec được backend (rgminer.cuda12/13)"
-             log_error "  đã giải nén vào cache — do cache hỏng (bị kill giữa chừng) hoặc thư mục noexec."
-             log_error "  Script sẽ tự dọn cache và thử lại; nếu vẫn lỗi: thử FORCE_REINSTALL=1,"
-             log_error "  hoặc đổi chỗ cache: RGMINER_BUNDLE_CACHE=/duong/dan/khac" ;;
+        126) log_error "Code=126: file TỒN TẠI nhưng KHÔNG THỂ THỰC THI (mất quyền +x, phân vùng noexec, hoặc file hỏng)." ;;
         127) log_error "Code=127: không tìm thấy file, hoặc thiếu dynamic loader/thư viện hệ thống (glibc quá cũ?)." ;;
         130) log_warn  "Code=130: bị dừng bởi Ctrl+C (SIGINT)." ;;
         132) log_error "Code=132 (SIGILL): CPU không hỗ trợ tập lệnh binary cần — sai kiến trúc hoặc CPU quá cũ." ;;
@@ -328,7 +244,7 @@ explain_exit_code() {
 #  BƯỚC 1: THÔNG TIN MÔI TRƯỜNG & PHIÊN BẢN
 # ============================================================================
 echo "============================================================="
-echo "  💎 Pearl (PRL) Miner Launcher"
+echo "  💎 Pearl (PRL) Miner Launcher — SRBMiner-Multi + LuckyPool"
 echo "  📌 PHIÊN BẢN SCRIPT : v$SCRIPT_VERSION (build $SCRIPT_BUILD_DATE)"
 echo "============================================================="
 
@@ -363,12 +279,6 @@ log_debug "Dung lượng đĩa: /tmp = $(df -h /tmp 2>/dev/null | awk 'NR==2{pri
 # ============================================================================
 log_step 2 "Kiểm tra cấu hình"
 
-MINING_MODE=$(printf '%s' "$MINING_MODE" | tr '[:lower:]' '[:upper:]')
-case "$MINING_MODE" in
-    GPU|CPU|DUAL) : ;;
-    *) die "MINING_MODE='$MINING_MODE' không hợp lệ. Chỉ chấp nhận: GPU | CPU | DUAL" ;;
-esac
-
 # Đảm bảo các biến cấu hình dạng số là số hợp lệ (tránh lỗi so sánh số học)
 ensure_number() {
     local name=$1 def=$2 val
@@ -385,37 +295,44 @@ ensure_number LONG_RESTART_DELAY 60
 ensure_number MAX_RETRIES 0
 ensure_number MIN_UPTIME 20
 ensure_number FAST_FAIL_LIMIT 5
+ensure_number GPU_TH_EST 350
+ensure_number API_PORT 21550
+ensure_number GPU_OFF_TEMP 90
+ensure_number NO_SHARE_RESTART 900
 
-log_info "MINING_MODE   : $MINING_MODE"
 log_info "WALLET        : $WALLET"
 log_info "WORKER        : $WORKER"
-log_info "POOL          : $POOL"
 log_info "ALGO          : $ALGO"
+if [ -n "$POOL" ]; then
+    log_info "POOL          : $POOL (chỉ định cứng — bỏ qua auto-chọn port)"
+else
+    log_info "POOL          : (tự chọn) $POOL_HOST + failover: $POOL_FAILOVER_HOSTS"
+    log_info "                port sẽ chọn ở BƯỚC 4 theo số GPU × ${GPU_TH_EST} TH/s"
+fi
+log_info "GPU           : chạy STOCK — script không OC/không chỉnh clock, power limit"
 log_info "EXTRA_ARGS    : ${EXTRA_ARGS:-(không có)}"
-log_info "RGMINER_VER   : $RGMINER_VERSION"
+log_info "SRB_VERSION   : $SRB_VERSION"
 log_debug "URL_DOWNLOAD  : $URL_DOWNLOAD"
-log_debug "BIN_PATH      : $BIN_PATH"
-log_debug "BACKEND       : ${RGMINER_BACKEND:-(auto)} | CACHE: $RGMINER_BUNDLE_CACHE"
+log_debug "EXPECTED_MD5  : ${EXPECTED_MD5:-(không kiểm)}"
+log_debug "INSTALL_DIR   : $INSTALL_DIR"
+log_debug "API_ENABLE=$API_ENABLE API_PORT=$API_PORT GPU_OFF_TEMP=${GPU_OFF_TEMP}°C NO_SHARE_RESTART=${NO_SHARE_RESTART}s"
 log_debug "DEBUG=$DEBUG FORCE_REINSTALL=$FORCE_REINSTALL RESTART_DELAY=${RESTART_DELAY}s MAX_RETRIES=$MAX_RETRIES MIN_UPTIME=${MIN_UPTIME}s"
 
 if [ -z "$WALLET" ]; then
     die "WALLET đang để trống!"
 fi
-case "$WALLET" in
-    prl*) log_debug "Định dạng ví: tiền tố 'prl' hợp lệ (độ dài ${#WALLET} ký tự)" ;;
+# LuckyPool hỗ trợ đào solo bằng cách thêm tiền tố "solo:" trước địa chỉ ví
+WALLET_CHECK=${WALLET#solo:}
+case "$WALLET_CHECK" in
+    prl*) log_debug "Định dạng ví: tiền tố 'prl' hợp lệ (độ dài ${#WALLET_CHECK} ký tự)" ;;
     *)    log_warn "Ví '$WALLET' không bắt đầu bằng 'prl' — kiểm tra lại địa chỉ ví Pearl!" ;;
 esac
-
-POOL_STRIPPED=${POOL#*://}
-POOL_HOST=${POOL_STRIPPED%%:*}
-POOL_PORT=${POOL_STRIPPED##*:}
-if [ "$POOL_HOST" = "$POOL_PORT" ]; then
-    log_warn "POOL '$POOL' thiếu cổng (định dạng đúng: host:port, vd asia.rplant.xyz:17168)"
-    POOL_PORT=""
+if [ "$WALLET" != "$WALLET_CHECK" ]; then
+    log_warn "Phát hiện tiền tố 'solo:' — bạn đang đào SOLO (tự chịu may rủi tìm block, không chia thưởng PPLNS)."
 fi
 
-if [ "$MINING_MODE" != "GPU" ]; then
-    log_warn "Lưu ý: rgminer là miner GPU (CUDA). Chế độ CPU/DUAL chỉ mang tính thử nghiệm."
+if [ "$ALGO" != "pearlhash" ]; then
+    log_warn "ALGO='$ALGO' khác mặc định 'pearlhash' — chắc chắn SRBMiner hỗ trợ thuật toán này?"
 fi
 
 # ============================================================================
@@ -424,7 +341,7 @@ fi
 log_step 3 "Kiểm tra công cụ hệ thống"
 
 MISSING=""
-for tool in od sha256sum awk grep tar gzip; do
+for tool in od md5sum sha256sum awk grep tar gzip; do
     if command -v "$tool" >/dev/null 2>&1; then
         log_debug "OK: $tool ($(command -v "$tool"))"
     else
@@ -457,14 +374,11 @@ done
 log_info "✅ Đủ công cụ cần thiết (trình tải: $DOWNLOADER)"
 
 # ============================================================================
-#  BƯỚC 4: KIỂM TRA GPU / DRIVER NVIDIA
+#  BƯỚC 4: KIỂM TRA GPU / DRIVER NVIDIA + CHỌN POOL/PORT
 # ============================================================================
-log_step 4 "Kiểm tra GPU / Driver NVIDIA"
+log_step 4 "Kiểm tra GPU / Driver NVIDIA + chọn pool/port"
 
-GPU_COUNT=0
-if [ "$MINING_MODE" = "CPU" ]; then
-    log_info "Chế độ CPU — bỏ qua kiểm tra GPU."
-elif ! command -v nvidia-smi >/dev/null 2>&1; then
+if ! command -v nvidia-smi >/dev/null 2>&1; then
     log_warn "KHÔNG tìm thấy nvidia-smi! Miner GPU gần như chắc chắn sẽ không chạy được."
     log_warn "  Nếu đang dùng Docker, container PHẢI chạy với: docker run --gpus all ..."
     log_warn "  và máy chủ phải cài nvidia-container-toolkit + driver NVIDIA."
@@ -475,10 +389,9 @@ else
         log_info "✅ Phát hiện $GPU_COUNT GPU:"
         echo "$GPU_INFO" | while IFS= read -r line; do log_info "   -> $line"; done
 
-        # --- Phân loại backend CUDA theo compute capability + driver ---
-        # (logic giống h-run.sh chính chủ: cap >= 12.x tức RTX 50xx/Blackwell
-        #  bắt buộc backend CUDA 13, mà CUDA 13 đòi driver >= MIN_CUDA13_DRIVER)
         DRIVER_VER=$(echo "$GPU_INFO" | head -n1 | awk -F',' '{print $2}' | tr -d ' ')
+
+        # Phát hiện thế hệ GPU qua compute capability (RTX 50xx/Blackwell = 12.x)
         GPU_CAPS=$(timeout 15 nvidia-smi --query-gpu=name,compute_cap --format=csv,noheader 2>/dev/null) || true
         MAX_CAP_MAJOR=0
         if [ -n "${GPU_CAPS:-}" ]; then
@@ -491,27 +404,19 @@ else
             done <<< "$GPU_CAPS"
         fi
 
-        SUGGESTED_BACKEND=""
-        if [ "$MAX_CAP_MAJOR" -ge 12 ]; then
-            log_info "GPU thế hệ Blackwell/RTX 50xx (compute cap ${MAX_CAP_MAJOR}.x) — BẮT BUỘC backend CUDA 13."
-            SUGGESTED_BACKEND="cuda13"
-            if [ -n "$DRIVER_VER" ] && version_ge "$DRIVER_VER" "$MIN_CUDA13_DRIVER"; then
-                log_info "✅ Driver $DRIVER_VER >= $MIN_CUDA13_DRIVER — đủ điều kiện chạy backend CUDA 13."
+        # Kiểm tra driver: SRBMiner khuyến nghị >= 580 cho 'pearlhash';
+        # RTX 50xx (Blackwell) tối thiểu cần nhánh 570 mới nhận GPU.
+        if [ -n "$DRIVER_VER" ]; then
+            if [ "$MAX_CAP_MAJOR" -ge 12 ] && ! version_ge "$DRIVER_VER" "$MIN_BLACKWELL_DRIVER"; then
+                log_error "GPU RTX 50xx (Blackwell) nhưng driver host = $DRIVER_VER < $MIN_BLACKWELL_DRIVER —"
+                log_error "  driver này KHÔNG nhận diện được RTX 50xx, miner sẽ không thấy GPU."
+                log_error "  => Nâng driver NVIDIA trên MÁY HOST (container dùng driver của host)."
+            elif ! version_ge "$DRIVER_VER" "$RECOMMENDED_DRIVER"; then
+                log_warn "Driver $DRIVER_VER < $RECOMMENDED_DRIVER — SRBMiner khuyến nghị driver >= $RECOMMENDED_DRIVER"
+                log_warn "  cho 'pearlhash' (bản cũ từng gây rejected shares). Vẫn chạy được nhưng nên nâng cấp."
             else
-                log_error "Driver hiện tại: ${DRIVER_VER:-?} — backend CUDA 13 của rgminer yêu cầu >= $MIN_CUDA13_DRIVER."
-                log_error "  Backend CUDA 12 thì KHÔNG hỗ trợ RTX 50xx (chỉ tới sm_90 = RTX 40xx),"
-                log_error "  nên rgminer gần như chắc chắn KHÔNG đào được cho tới khi nâng driver."
-                log_error "  => Cách sửa: nâng driver NVIDIA >= 595.58.03 TRÊN MÁY HOST (driver là của host,"
-                log_error "     không cài được từ trong container). Nếu thuê máy (vast.ai/runpod...),"
-                log_error "     hãy chọn host có driver mới hơn hoặc yêu cầu nhà cung cấp nâng cấp."
+                log_info "✅ Driver $DRIVER_VER >= $RECOMMENDED_DRIVER — đạt khuyến nghị của SRBMiner cho pearlhash."
             fi
-        elif [ "$MAX_CAP_MAJOR" -gt 0 ]; then
-            log_debug "Compute cap tối đa: ${MAX_CAP_MAJOR}.x — backend CUDA 12/13 đều dùng được, để launcher tự chọn."
-        fi
-
-        if [ -z "$RGMINER_BACKEND" ] && [ -n "$SUGGESTED_BACKEND" ]; then
-            RGMINER_BACKEND="$SUGGESTED_BACKEND"
-            log_info "Tự chọn RGMINER_BACKEND=$RGMINER_BACKEND theo GPU/driver (giống h-run.sh chính chủ)."
         fi
     else
         log_warn "nvidia-smi có nhưng chạy lỗi: $GPU_INFO"
@@ -519,17 +424,36 @@ else
     fi
 fi
 
-if [ -n "$RGMINER_BACKEND" ]; then
-    export RGMINER_BACKEND
-    log_info "Backend rgminer: RGMINER_BACKEND=$RGMINER_BACKEND (đã export cho miner)"
+# --- Chọn port LuckyPool theo tổng hashrate ước tính rồi ghép danh sách pool ---
+if [ -n "$POOL" ]; then
+    POOL_LIST="$POOL"
+    log_info "Dùng pool chỉ định cứng: $POOL_LIST"
 else
-    log_debug "RGMINER_BACKEND để trống — launcher của rgminer sẽ tự chọn (auto)."
+    EST_TH=$(( GPU_COUNT * GPU_TH_EST ))
+    if [ "$EST_TH" -gt 1000 ]; then
+        LUCKY_PORT=3362
+    elif [ "$EST_TH" -ge 500 ]; then
+        LUCKY_PORT=3361
+    else
+        LUCKY_PORT=3360
+    fi
+    if [ "$GPU_COUNT" -eq 0 ]; then
+        log_warn "Chưa phát hiện GPU nào — tạm dùng port mặc định 3360 (vardiff sẽ tự điều chỉnh)."
+    else
+        log_info "Tổng hashrate ước tính: ${GPU_COUNT} GPU × ${GPU_TH_EST} TH/s = ~${EST_TH} TH/s => chọn port $LUCKY_PORT"
+        log_debug "Ngưỡng port LuckyPool: 3360 (<500 TH/s) | 3361 (500-1000) | 3362 (>1000) — chỉ khác độ khó khởi điểm"
+    fi
+    POOL_LIST="${POOL_HOST}:${LUCKY_PORT}"
+    for fh in $POOL_FAILOVER_HOSTS; do
+        POOL_LIST="${POOL_LIST},${fh}:${LUCKY_PORT}"
+    done
+    log_info "Danh sách pool (chính → failover): $POOL_LIST"
 fi
 
 # ============================================================================
-#  BƯỚC 5: CÀI ĐẶT & KIỂM ĐỊNH BINARY RGMINER
+#  BƯỚC 5: CÀI ĐẶT & KIỂM ĐỊNH SRBMINER-MULTI
 # ============================================================================
-log_step 5 "Cài đặt & kiểm định binary rgminer"
+log_step 5 "Cài đặt & kiểm định SRBMiner-Multi v$SRB_VERSION"
 
 # Kiểm định toàn diện 1 binary; trả về 0 nếu dùng được
 validate_binary() {
@@ -556,7 +480,7 @@ validate_binary() {
     [ "$ok" = "1" ] || return 1
     chmod +x "$p" 2>/dev/null || true
     if [ ! -x "$p" ]; then log_error "Kiểm định FAIL: không gán được quyền thực thi (+x) cho $p"; return 1; fi
-    log_debug "Kiểm định OK: ELF $(elf_arch_of "$p"), $size bytes, sha256=$(sha256_of "$p" | head -c 16)..."
+    log_debug "Kiểm định OK: ELF $(elf_arch_of "$p"), $size bytes, md5=$(md5_of "$p")"
     return 0
 }
 
@@ -572,7 +496,7 @@ download_file() {
         log_error "Tải thất bại (mã lỗi $DOWNLOADER: $rc). Chi tiết:"
         while IFS= read -r line; do log_error "   | $line"; done < <(tail -5 "$errlog")
         if grep -qi "404" "$errlog"; then
-            log_error "   => Lỗi 404: URL sai hoặc release đã đổi tên file. Kiểm tra: https://github.com/Printscan/rgminer/releases"
+            log_error "   => Lỗi 404: URL sai hoặc release đã đổi tên file. Kiểm tra: https://github.com/doktor83/SRBMiner-Multi/releases"
         elif grep -qi "certificate\|ssl" "$errlog"; then
             log_error "   => Lỗi SSL: cài ca-certificates (apt-get install -y ca-certificates)"
         elif grep -qi "resolve\|unknown host" "$errlog"; then
@@ -580,260 +504,219 @@ download_file() {
         fi
         return 1
     fi
-    log_debug "Đã tải xong: $(stat -c %s "$out" 2>/dev/null) bytes, sha256=$(sha256_of "$out")"
+    log_debug "Đã tải xong: $(stat -c %s "$out" 2>/dev/null) bytes, md5=$(md5_of "$out")"
     return 0
 }
 
+# Tìm binary SRBMiner-MULTI trong thư mục cài đặt (gói tar có 1 thư mục con)
+locate_installed_binary() {
+    BIN_PATH=$(find "$INSTALL_DIR" -maxdepth 2 -type f -name "SRBMiner-MULTI" 2>/dev/null | head -n1)
+    if [ -n "$BIN_PATH" ]; then
+        BIN_DIR=$(dirname "$BIN_PATH")
+        return 0
+    fi
+    return 1
+}
+
 install_miner() {
-    TMP_DIR=$(mktemp -d /tmp/rgminer.XXXXXX) || die "Không tạo được thư mục tạm trong /tmp (đĩa đầy?)"
-    local pkg="$TMP_DIR/pkg"
+    TMP_DIR=$(mktemp -d /tmp/srbminer.XXXXXX) || die "Không tạo được thư mục tạm trong /tmp (đĩa đầy?)"
+    local pkg="$TMP_DIR/pkg.tar.gz"
 
-    download_file "$URL_DOWNLOAD" "$pkg" || die "Không tải được rgminer. Xem chi tiết lỗi phía trên."
+    download_file "$URL_DOWNLOAD" "$pkg" || die "Không tải được SRBMiner-Multi. Xem chi tiết lỗi phía trên."
 
-    if [ -n "$EXPECTED_SHA256" ]; then
+    if [ -n "$EXPECTED_MD5" ]; then
         local actual
-        actual=$(sha256_of "$pkg")
-        if [ "$actual" != "$EXPECTED_SHA256" ]; then
-            log_error "SHA256 thực tế : $actual"
-            log_error "SHA256 mong đợi: $EXPECTED_SHA256"
-            die "Checksum KHÔNG khớp — file tải về không đúng như mong đợi!"
+        actual=$(md5_of "$pkg")
+        if [ "$actual" != "$EXPECTED_MD5" ]; then
+            log_error "MD5 thực tế : $actual"
+            log_error "MD5 mong đợi: $EXPECTED_MD5 (công bố trên trang release chính chủ)"
+            dump_file_info "$pkg"
+            die "Checksum MD5 KHÔNG khớp — file tải về không đúng như mong đợi!"
         fi
-        log_info "✅ Checksum SHA256 khớp."
+        log_info "✅ Checksum MD5 khớp bản chính chủ."
+    else
+        log_warn "Không có MD5 mong đợi cho version '$SRB_VERSION' — bỏ qua bước so checksum (đặt EXPECTED_MD5 nếu muốn kiểm)."
     fi
 
-    local src_bin=""
-    case "$URL_DOWNLOAD" in
-        *.tar.gz|*.tgz)
-            log_info "📂 Gói nén .tar.gz — đang giải nén..."
-            mkdir -p "$TMP_DIR/extract"
-            tar -xzf "$pkg" -C "$TMP_DIR/extract" 2>"$TMP_DIR/tar.err" || {
-                log_error "Giải nén thất bại: $(cat "$TMP_DIR/tar.err")"
-                dump_file_info "$pkg"
-                die "File tải về không phải gói tar.gz hợp lệ."
-            }
-            log_debug "Nội dung gói: $(tar -tzf "$pkg" 2>/dev/null | head -10 | tr '\n' ' ')"
-            # Chọn file ELF lớn nhất tên rgminer* trong gói (tránh nhầm script phụ)
-            local cand
-            while IFS= read -r cand; do
-                if is_elf "$cand"; then src_bin="$cand"; break; fi
-            done < <(find "$TMP_DIR/extract" -type f -name "rgminer*" -exec du -b {} + 2>/dev/null | sort -rn | awk '{print $2}')
-            if [ -z "$src_bin" ]; then
-                log_error "Không tìm thấy binary ELF nào tên 'rgminer*' trong gói. Danh sách file:"
-                find "$TMP_DIR/extract" -type f | head -20 | while IFS= read -r f; do log_error "   | $f"; done
-                die "Cấu trúc gói tải về không như mong đợi."
-            fi
-            log_debug "Đã chọn binary trong gói: $src_bin"
-            ;;
-        *)
-            src_bin="$pkg"   # URL trỏ thẳng vào binary
-            ;;
-    esac
+    log_info "📂 Đang giải nén gói tar.gz..."
+    mkdir -p "$TMP_DIR/extract"
+    tar -xzf "$pkg" -C "$TMP_DIR/extract" 2>"$TMP_DIR/tar.err" || {
+        log_error "Giải nén thất bại: $(cat "$TMP_DIR/tar.err")"
+        dump_file_info "$pkg"
+        die "File tải về không phải gói tar.gz hợp lệ."
+    }
+    log_debug "Nội dung gói: $(tar -tzf "$pkg" 2>/dev/null | head -10 | tr '\n' ' ')"
 
+    local src_bin
+    src_bin=$(find "$TMP_DIR/extract" -type f -name "SRBMiner-MULTI" 2>/dev/null | head -n1)
+    if [ -z "$src_bin" ]; then
+        log_error "Không tìm thấy binary 'SRBMiner-MULTI' trong gói. Danh sách file:"
+        find "$TMP_DIR/extract" -type f | head -20 | while IFS= read -r f; do log_error "   | $f"; done
+        die "Cấu trúc gói tải về không như mong đợi."
+    fi
     if ! validate_binary "$src_bin"; then
         dump_file_info "$src_bin"
-        die "File tải về KHÔNG phải binary hợp lệ — xem chẩn đoán phía trên."
+        die "Binary trong gói KHÔNG hợp lệ — xem chẩn đoán phía trên."
     fi
 
-    mv -f "$src_bin" "$BIN_PATH" || die "Không ghi được vào $BIN_PATH (thiếu quyền?)"
-    chmod +x "$BIN_PATH"
+    # Dọn bản cũ rồi chuyển cả thư mục đã giải nén vào INSTALL_DIR
+    rm -rf "${INSTALL_DIR:?}"/* 2>/dev/null || true
+    local src_dir
+    src_dir=$(dirname "$src_bin")
+    mv -f "$src_dir" "$INSTALL_DIR/" || die "Không ghi được vào $INSTALL_DIR (thiếu quyền?)"
+    echo "$SRB_VERSION" > "$VERSION_FILE" 2>/dev/null || true
     rm -rf "$TMP_DIR"; TMP_DIR=""
-    log_info "✅ Đã cài rgminer vào: $BIN_PATH"
+
+    locate_installed_binary || die "Cài xong nhưng không tìm thấy binary trong $INSTALL_DIR?!"
+    chmod +x "$BIN_PATH" 2>/dev/null || true
+    log_info "✅ Đã cài SRBMiner-Multi vào: $BIN_PATH"
 }
 
 mkdir -p "$INSTALL_DIR" 2>/dev/null || true
 if [ ! -w "$INSTALL_DIR" ]; then
-    die "Không có quyền ghi vào '$INSTALL_DIR'. Chạy bằng root, hoặc đặt INSTALL_DIR=\$HOME/bin"
+    die "Không có quyền ghi vào '$INSTALL_DIR'. Chạy bằng root, hoặc đặt INSTALL_DIR=\$HOME/srbminer"
 fi
 
-if [ "$FORCE_REINSTALL" = "1" ] && [ -e "$BIN_PATH" ]; then
-    log_warn "FORCE_REINSTALL=1 — xoá binary cũ tại $BIN_PATH để tải lại."
-    rm -rf "$BIN_PATH"
+INSTALLED_VERSION=""
+if [ -f "$VERSION_FILE" ]; then INSTALLED_VERSION=$(head -n1 "$VERSION_FILE" 2>/dev/null | tr -d ' \r\n'); fi
+
+if [ "$FORCE_REINSTALL" = "1" ]; then
+    log_warn "FORCE_REINSTALL=1 — xoá bản cài cũ trong $INSTALL_DIR để tải lại."
+    rm -rf "${INSTALL_DIR:?}"/* "$VERSION_FILE" 2>/dev/null || true
+    INSTALLED_VERSION=""
 fi
 
-# Dọn binary hỏng do script phiên bản cũ (v1.x) để lại
-for old_bin in "$INSTALL_DIR/rgminer-gpu" "$INSTALL_DIR/rgminer-cpu"; do
-    if [ -e "$old_bin" ] && ! validate_binary "$old_bin" >/dev/null 2>&1; then
-        log_warn "Phát hiện file hỏng do script cũ (v1.x) để lại: $old_bin — đang xoá."
-        rm -rf "$old_bin"
-    fi
-done
-
-if [ -e "$BIN_PATH" ]; then
-    log_info "Binary đã tồn tại: $BIN_PATH — kiểm định lại trước khi dùng..."
-    if validate_binary "$BIN_PATH"; then
-        log_info "✅ Binary cũ hợp lệ, dùng lại (muốn tải mới: chạy với FORCE_REINSTALL=1)"
-    else
-        log_warn "Binary cũ KHÔNG hợp lệ — đây thường là nguyên nhân lỗi Code=126 lặp vô hạn!"
-        dump_file_info "$BIN_PATH"
-        rm -rf "$BIN_PATH"
-        install_miner
-    fi
+if [ -n "$INSTALLED_VERSION" ] && [ "$INSTALLED_VERSION" = "$SRB_VERSION" ] && locate_installed_binary && validate_binary "$BIN_PATH"; then
+    log_info "✅ Đã có sẵn SRBMiner-Multi v$INSTALLED_VERSION hợp lệ: $BIN_PATH (muốn tải mới: FORCE_REINSTALL=1)"
 else
+    if [ -n "$INSTALLED_VERSION" ] && [ "$INSTALLED_VERSION" != "$SRB_VERSION" ]; then
+        log_info "Bản cài cũ là v$INSTALLED_VERSION ≠ v$SRB_VERSION yêu cầu — tải lại."
+    fi
     install_miner
 fi
 
-# Chuẩn bị cache cho launcher (rgminer tự giải nén backend vào đây khi chạy)
-prepare_bundle_cache
-clean_bundle_cache   # dọn payload hỏng từ các lần chạy trước — nguyên nhân Code=126 "câm" phổ biến
-
-# Chạy thử nhẹ (smoke test) để chắc chắn binary + backend thực thi được trên máy này
+# Chạy thử nhẹ (smoke test): liệt kê thuật toán và xác nhận có 'pearlhash'
 SMOKE_RUNNER=()
 if command -v timeout >/dev/null 2>&1; then SMOKE_RUNNER=(timeout 30); fi
 
-run_smoke() {
-    SMOKE_RC=0
-    SMOKE_OUT=$("${SMOKE_RUNNER[@]}" "$BIN_PATH" --list-algos 2>&1) || SMOKE_RC=$?
-}
+log_info "🔬 Chạy thử binary ($BIN_PATH --list-algorithms)..."
+SMOKE_RC=0
+SMOKE_OUT=$(cd "$BIN_DIR" && "${SMOKE_RUNNER[@]}" "$BIN_PATH" --list-algorithms 2>&1) || SMOKE_RC=$?
 
-# Chạy thử backend TRỰC TIẾP — kế hoạch B khi launcher không exec được backend.
-# LD_LIBRARY_PATH trỏ vào thư mục cache để backend nạp libssl.so.1.1 đi kèm.
-run_smoke_direct() {
-    SMOKE_RC=0
-    SMOKE_OUT=$(cd "$BACKEND_DIR" && \
-        LD_LIBRARY_PATH="$BACKEND_DIR${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
-        RGMINER_LAUNCHER_DIR="$BACKEND_DIR" \
-        "${SMOKE_RUNNER[@]}" "$BACKEND_BIN" --list-algos 2>&1) || SMOKE_RC=$?
-}
-
-log_info "🔬 Chạy thử binary ($BIN_PATH --list-algos)..."
-run_smoke
-
-# Launcher trả 126/127 = không exec được backend. Trên một số máy/container,
-# launcher GIẢI NÉN thành công nhưng cú exec cuối bị chặn (seccomp/AppArmor).
-# => KẾ HOẠCH B: chạy thẳng backend đã giải nén trong cache, bỏ qua launcher.
-if [ "$SMOKE_RC" -eq 126 ] || [ "$SMOKE_RC" -eq 127 ]; then
-    log_warn "Launcher thất bại Code=$SMOKE_RC — kiểm tra backend đã giải nén trong cache:"
-    dump_cache_info
-    if locate_backend; then
-        log_warn "KẾ HOẠCH B: thử chạy TRỰC TIẾP backend (bỏ qua launcher): $BACKEND_BIN"
-        run_smoke_direct
-        if [ "$SMOKE_RC" -eq 0 ]; then
-            MINER_EXEC_MODE="direct"
-            log_info "✅ Backend chạy trực tiếp OK — chuyển sang chế độ DIRECT (không dùng launcher nữa)."
-        else
-            log_warn "Backend trực tiếp cũng thất bại (Code=$SMOKE_RC). Output: $(echo "$SMOKE_OUT" | head -2 | tr '\n' ' ')"
-        fi
+if [ "$SMOKE_RC" -eq 0 ] || echo "$SMOKE_OUT" | grep -qi "$ALGO"; then
+    if echo "$SMOKE_OUT" | grep -qi "$ALGO"; then
+        log_info "✅ Binary chạy được và CÓ hỗ trợ thuật toán '$ALGO'."
+        echo "$SMOKE_OUT" | grep -i "$ALGO" | head -3 | while IFS= read -r line; do log_debug "   | $line"; done
     else
-        log_warn "Cache chưa có backend hợp lệ để chạy trực tiếp."
+        log_error "Binary chạy được nhưng KHÔNG thấy '$ALGO' trong danh sách thuật toán!"
+        echo "$SMOKE_OUT" | head -40 | while IFS= read -r line; do log_error "   | $line"; done
+        die "Version SRBMiner này không hỗ trợ '$ALGO' — cần SRB_VERSION >= 3.3.1 (hiện đặt: $SRB_VERSION)."
     fi
-    if [ "$MINER_EXEC_MODE" = "launcher" ]; then
-        clean_bundle_cache
-        log_info "Dọn cache xong — thử lại launcher (lần 2, launcher sẽ giải nén lại từ đầu)..."
-        run_smoke
-        if { [ "$SMOKE_RC" -eq 126 ] || [ "$SMOKE_RC" -eq 127 ]; } && locate_backend; then
-            log_warn "Launcher vẫn lỗi nhưng đã giải nén backend mới — thử DIRECT với backend mới..."
-            run_smoke_direct
-            if [ "$SMOKE_RC" -eq 0 ]; then
-                MINER_EXEC_MODE="direct"
-                log_info "✅ Backend (mới giải nén) chạy trực tiếp OK — chuyển sang chế độ DIRECT."
-            fi
-        fi
-    fi
-fi
-
-if [ "$SMOKE_RC" -eq 0 ]; then
-    if [ "$MINER_EXEC_MODE" = "direct" ]; then
-        log_info "✅ Sẵn sàng đào ở chế độ DIRECT: $BACKEND_BIN"
-    else
-        log_info "✅ Binary + backend chạy được qua launcher."
-    fi
-    echo "$SMOKE_OUT" | head -8 | while IFS= read -r line; do log_debug "   | $line"; done
 elif [ "$SMOKE_RC" -eq 124 ]; then
     log_warn "Chạy thử bị timeout sau 30s (bất thường nhưng không chặn) — tiếp tục."
 elif echo "$SMOKE_OUT" | grep -qi "GLIBC"; then
     log_error "Output: $(echo "$SMOKE_OUT" | head -3)"
     die "Thiếu GLIBC — image/OS quá cũ so với binary. Dùng Ubuntu 22.04/24.04 (vd image nvidia/cuda:12.x-base-ubuntu22.04)."
-elif [ "$SMOKE_RC" -eq 126 ] || [ "$SMOKE_RC" -eq 127 ] || [ "$SMOKE_RC" -eq 132 ] || [ "$SMOKE_RC" -eq 139 ]; then
-    if [ -n "$SMOKE_OUT" ]; then
-        log_error "Chạy thử thất bại (Code=$SMOKE_RC). Output: $(echo "$SMOKE_OUT" | head -3)"
-    else
-        log_error "Chạy thử thất bại (Code=$SMOKE_RC) — KHÔNG có output (launcher thoát câm: lỗi exec backend)."
-    fi
+else
+    log_error "Chạy thử thất bại (Code=$SMOKE_RC). Output:"
+    echo "$SMOKE_OUT" | head -10 | while IFS= read -r line; do log_error "   | $line"; done
     explain_exit_code "$SMOKE_RC"
     dump_file_info "$BIN_PATH"
-    dump_cache_info
-    # strace (nếu có) sẽ chỉ ra CHÍNH XÁC syscall exec nào lỗi và errno gì
-    if command -v strace >/dev/null 2>&1; then
-        STRACE_LOG="/tmp/rgminer-strace.log"
-        log_warn "Chạy strace để tìm syscall exec bị lỗi (log đầy đủ: $STRACE_LOG)..."
-        "${SMOKE_RUNNER[@]}" strace -f -qq -s 160 -e trace=execve,execveat -o "$STRACE_LOG" "$BIN_PATH" --list-algos >/dev/null 2>&1 || true
-        if [ -s "$STRACE_LOG" ]; then
-            log_error "Các dòng exec cuối cùng (errno ở cuối dòng = lý do chính xác):"
-            grep -E "execve|execveat" "$STRACE_LOG" 2>/dev/null | tail -6 | while IFS= read -r line; do log_error "   | $line"; done
-        else
-            log_warn "strace không thu được dữ liệu (container có thể chặn ptrace)."
-        fi
-    else
-        log_warn "Mẹo: cài strace (apt-get update && apt-get install -y strace) rồi chạy lại —"
-        log_warn "  script sẽ tự dùng strace để chỉ ra chính xác syscall exec bị chặn và errno."
-    fi
-    # Thử ép từng backend qua launcher để khoanh vùng lỗi
-    for try_backend in cuda13 cuda12; do
-        TRY_RC=0
-        TRY_OUT=$(RGMINER_BACKEND="$try_backend" "${SMOKE_RUNNER[@]}" "$BIN_PATH" --list-algos 2>&1) || TRY_RC=$?
-        log_error "  Thử ép RGMINER_BACKEND=$try_backend => Code=$TRY_RC $(echo "$TRY_OUT" | head -1)"
-    done
-    die "Cả launcher lẫn backend trực tiếp đều không chạy được. Gợi ý: xem errno trong strace ở trên; thử RGMINER_BUNDLE_CACHE=/duong/dan/khac; chạy container không kèm seccomp/AppArmor tuỳ chỉnh (--security-opt seccomp=unconfined) hoặc đổi host."
-else
-    log_warn "Chạy thử trả về Code=$SMOKE_RC (không chặn). Output đầu:"
-    echo "$SMOKE_OUT" | head -5 | while IFS= read -r line; do log_warn "   | $line"; done
+    die "Binary SRBMiner-MULTI không chạy được trên máy này — xem chẩn đoán phía trên."
 fi
 
 # ============================================================================
 #  BƯỚC 6: KIỂM TRA KẾT NỐI POOL
 # ============================================================================
-log_step 6 "Kiểm tra kết nối pool ($POOL_HOST:${POOL_PORT:-?})"
+log_step 6 "Kiểm tra kết nối pool"
 
-if command -v getent >/dev/null 2>&1; then
-    POOL_IPS=$(getent hosts "$POOL_HOST" 2>/dev/null | awk '{print $1}' | tr '\n' ' ') || true
-    if [ -n "${POOL_IPS:-}" ]; then
-        log_info "✅ DNS OK: $POOL_HOST -> $POOL_IPS"
-    else
-        log_warn "Không phân giải được DNS '$POOL_HOST' — kiểm tra mạng/DNS container (miner sẽ tự thử lại)."
+POOL_OK=0
+POOL_ARR=()
+IFS=',' read -r -a POOL_ARR <<< "$POOL_LIST" || true
+for pool_entry in "${POOL_ARR[@]}"; do
+    p_stripped=${pool_entry#*://}
+    p_host=${p_stripped%%:*}
+    p_port=${p_stripped##*:}
+    if [ "$p_host" = "$p_port" ]; then
+        log_warn "Pool '$pool_entry' thiếu cổng (định dạng đúng: host:port)"
+        p_port=""
     fi
-fi
-if [ -n "$POOL_PORT" ] && command -v timeout >/dev/null 2>&1; then
-    if timeout 7 bash -c 'exec 3<>"/dev/tcp/$0/$1"' "$POOL_HOST" "$POOL_PORT" 2>/dev/null; then
-        log_info "✅ Kết nối TCP tới $POOL_HOST:$POOL_PORT thành công."
-    else
-        log_warn "KHÔNG kết nối TCP được tới $POOL_HOST:$POOL_PORT (firewall? pool sập? sai port?)"
-        log_warn "  Miner vẫn sẽ được khởi chạy và tự thử lại — nhưng nếu miner thoát ngay, đây là nguyên nhân chính."
+    if command -v getent >/dev/null 2>&1; then
+        p_ips=$(getent hosts "$p_host" 2>/dev/null | awk '{print $1}' | tr '\n' ' ') || true
+        if [ -n "${p_ips:-}" ]; then
+            log_debug "DNS OK: $p_host -> $p_ips"
+        else
+            log_warn "Không phân giải được DNS '$p_host' — kiểm tra mạng/DNS container."
+        fi
     fi
+    if [ -n "$p_port" ] && command -v timeout >/dev/null 2>&1; then
+        if timeout 7 bash -c 'exec 3<>"/dev/tcp/$0/$1"' "$p_host" "$p_port" 2>/dev/null; then
+            log_info "✅ Kết nối TCP tới $p_host:$p_port thành công."
+            POOL_OK=1
+        else
+            log_warn "KHÔNG kết nối TCP được tới $p_host:$p_port (firewall? pool sập? sai port?)"
+        fi
+    fi
+done
+if [ "$POOL_OK" -eq 0 ]; then
+    log_warn "Chưa kết nối được pool nào trong danh sách — miner vẫn sẽ khởi chạy và tự thử lại,"
+    log_warn "  nhưng nếu miner thoát ngay thì mạng/firewall là nguyên nhân chính."
 fi
 
 # ============================================================================
 #  BƯỚC 7: VÒNG LẶP ĐÀO
 # ============================================================================
-log_step 7 "Bắt đầu vòng lặp đào (mode: $MINING_MODE)"
+log_step 7 "Bắt đầu vòng lặp đào (SRBMiner-Multi v$SRB_VERSION, GPU stock)"
 
 EXTRA_ARR=()
 if [ -n "$EXTRA_ARGS" ]; then read -r -a EXTRA_ARR <<< "$EXTRA_ARGS" || true; fi
 
+# Lệnh đào: GPU stock — KHÔNG có bất kỳ cờ OC nào (--gpu-cclock/--gpu-plimit...)
+MINER_CMD=(
+    "$BIN_PATH"
+    --algorithm "$ALGO"
+    --pool "$POOL_LIST"
+    --wallet "$WALLET"
+    --worker "$WORKER"
+    --disable-cpu
+    --keepalive true
+    --give-up-limit 3
+    --retry-time 10
+    --enable-restart-on-rejected
+)
+if [ "$NO_SHARE_RESTART" -gt 0 ]; then
+    MINER_CMD+=(--max-no-share-sent "$NO_SHARE_RESTART")
+fi
+if [ "$GPU_OFF_TEMP" -gt 0 ]; then
+    MINER_CMD+=(--gpu-off-temperature "$GPU_OFF_TEMP")
+fi
+if [ "$API_ENABLE" = "1" ]; then
+    MINER_CMD+=(--api-enable --api-port "$API_PORT" --api-rig-name "$WORKER")
+fi
+if [ "$DEBUG" = "1" ]; then
+    MINER_CMD+=(--extended-log)
+fi
+if [ ${#EXTRA_ARR[@]} -gt 0 ]; then MINER_CMD+=("${EXTRA_ARR[@]}"); fi
+
+if [ "$API_ENABLE" = "1" ]; then
+    log_info "📊 API giám sát: http://<ip-máy>:$API_PORT/stats (Docker cần -p $API_PORT:$API_PORT)"
+fi
+
 launch_miner() {
-    local wname=$1
-    local bin="$BIN_PATH"
-    if [ "$MINER_EXEC_MODE" = "direct" ]; then bin="$BACKEND_BIN"; fi
-    local cmd=("$bin" --algo "$ALGO" --stratum "$POOL" --wallet "$WALLET" --worker-name "$wname")
-    if [ ${#EXTRA_ARR[@]} -gt 0 ]; then cmd+=("${EXTRA_ARR[@]}"); fi
-    if [ "$MINER_EXEC_MODE" = "direct" ]; then
-        log_info "🚀 Lệnh chạy (DIRECT — bỏ qua launcher): ${cmd[*]}"
-        # launch_miner luôn được gọi trong subshell nền nên cd ở đây an toàn
-        cd "$BACKEND_DIR" 2>/dev/null || true
-        LD_LIBRARY_PATH="$BACKEND_DIR${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
-        RGMINER_LAUNCHER_DIR="$BACKEND_DIR" \
-            "${cmd[@]}"
-    else
-        log_info "🚀 Lệnh chạy: ${RGMINER_BACKEND:+RGMINER_BACKEND=$RGMINER_BACKEND }${cmd[*]}"
-        log_debug "Cache backend: $RGMINER_BUNDLE_CACHE"
-        "${cmd[@]}"
-    fi
+    log_info "🚀 Lệnh chạy: ${MINER_CMD[*]}"
+    # launch_miner luôn được gọi trong subshell nền nên cd ở đây an toàn —
+    # chạy trong thư mục binary để file Autotune/log của miner nằm gọn một chỗ.
+    # exec để subshell BIẾN THÀNH tiến trình miner => kill MINER_PID khi nhận
+    # SIGTERM (docker stop) sẽ tắt đúng miner, không bỏ rơi tiến trình mồ côi.
+    cd "$BIN_DIR" 2>/dev/null || true
+    exec "${MINER_CMD[@]}"
 }
 
 # Chạy miner ở tiến trình nền rồi 'wait' — nhờ vậy script nhận được SIGTERM
 # (docker stop) NGAY LẬP TỨC và tắt miner sạch sẽ thay vì bị SIGKILL sau 10s.
 run_fg() {
     local rc=0
-    launch_miner "$1" &
+    launch_miner &
     MINER_PID=$!
     wait "$MINER_PID" || rc=$?
     MINER_PID=""
@@ -851,65 +734,19 @@ while :; do
     fi
 
     hr
-    log_info "▶️  Lần chạy #$ATTEMPT (script v$SCRIPT_VERSION, chế độ exec: $MINER_EXEC_MODE, $(date '+%H:%M:%S'))"
+    log_info "▶️  Lần chạy #$ATTEMPT (script v$SCRIPT_VERSION, miner v$SRB_VERSION, $(date '+%H:%M:%S'))"
     if [ ! -x "$BIN_PATH" ]; then
         dump_file_info "$BIN_PATH"
         die "Binary $BIN_PATH biến mất hoặc mất quyền thực thi giữa chừng!"
     fi
-    # Chế độ DIRECT: nếu backend trong cache biến mất, chạy launcher 1 lần để
-    # nó giải nén lại (kể cả khi exec của launcher lỗi, phần giải nén vẫn chạy)
-    if [ "$MINER_EXEC_MODE" = "direct" ] && [ ! -x "$BACKEND_BIN" ]; then
-        log_warn "Backend DIRECT biến mất ($BACKEND_BIN) — chạy launcher để giải nén lại..."
-        run_smoke
-        if ! locate_backend; then
-            die "Không khôi phục được backend trong cache — chạy lại script từ đầu."
-        fi
-        log_info "Đã khôi phục backend: $BACKEND_BIN"
-    fi
 
     START_TS=$(date +%s)
     EXIT_CODE=0
-
-    case "$MINING_MODE" in
-        GPU)
-            run_fg "${WORKER}-gpu" || EXIT_CODE=$?
-            ;;
-        CPU)
-            run_fg "${WORKER}-cpu" || EXIT_CODE=$?
-            ;;
-        DUAL)
-            log_info "Khởi chạy instance CPU chạy nền (log riêng: $CPU_LOG)"
-            echo "===== [$(ts)] DUAL attempt #$ATTEMPT =====" >> "$CPU_LOG"
-            launch_miner "${WORKER}-cpu" >> "$CPU_LOG" 2>&1 &
-            CPU_PID=$!
-            log_info "Instance CPU PID=$CPU_PID (xem log: tail -f $CPU_LOG). Instance GPU chạy chính..."
-            run_fg "${WORKER}-gpu" || EXIT_CODE=$?
-            if kill -0 "$CPU_PID" 2>/dev/null; then
-                log_debug "Dừng instance CPU (PID=$CPU_PID) để restart đồng bộ..."
-                kill "$CPU_PID" 2>/dev/null || true
-                wait "$CPU_PID" 2>/dev/null || true
-            fi
-            CPU_PID=""
-            ;;
-    esac
+    run_fg || EXIT_CODE=$?
 
     DURATION=$(( $(date +%s) - START_TS ))
     log_warn "⚠️  Miner thoát: Code=$EXIT_CODE sau khi chạy được ${DURATION}s (lần #$ATTEMPT)"
     explain_exit_code "$EXIT_CODE"
-
-    # Crash ngay khi vừa chạy (126/127) => chẩn đoán sâu ngay + tự dọn cache
-    # backend để lần restart sau launcher giải nén lại sạch sẽ (tự phục hồi).
-    # Ở chế độ DIRECT thì KHÔNG dọn cache (sẽ xoá mất chính backend đang dùng).
-    if [ "$EXIT_CODE" -eq 126 ] || [ "$EXIT_CODE" -eq 127 ]; then
-        if [ "$DEEP_DIAG_DONE" -eq 0 ]; then
-            dump_file_info "$BIN_PATH"
-            dump_cache_info
-            DEEP_DIAG_DONE=1
-        fi
-        if [ "$MINER_EXEC_MODE" = "launcher" ]; then
-            clean_bundle_cache
-        fi
-    fi
 
     DELAY=$RESTART_DELAY
     if [ "$DURATION" -lt "$MIN_UPTIME" ]; then
@@ -923,7 +760,7 @@ while :; do
             fi
             DELAY=$LONG_RESTART_DELAY
             log_error "Lỗi có vẻ KHÔNG tự hết (crash $FAST_FAILS lần liên tiếp). Giãn thời gian chờ lên ${DELAY}s."
-            log_error "Gợi ý: đọc kỹ log [ERROR] phía trên; thử FORCE_REINSTALL=1; kiểm tra '--gpus all' và driver."
+            log_error "Gợi ý: đọc kỹ log [ERROR] phía trên; thử FORCE_REINSTALL=1; kiểm tra '--gpus all' và driver >= $RECOMMENDED_DRIVER."
         fi
     else
         FAST_FAILS=0
