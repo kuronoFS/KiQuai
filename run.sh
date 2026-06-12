@@ -1,90 +1,95 @@
 #!/bin/bash
 set -e
-set -u # Giữ nguyên chế độ kiểm tra biến nghiêm ngặt của bạn
+set -u 
 
 # =====================================================================
-# LỖI DÒNG 10: Sửa BASH_SOURCE để không bị crash "unbound variable" 
-# khi bạn chạy script dạng stream/pipe qua Docker hoặc Curl
+# FIX LỖI DÒNG 10: Tránh crash "unbound variable" khi pipe qua Docker/Curl
 # =====================================================================
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)
 
-# --- Cấu hình các biến gốc của bạn ---
-MINING_MODE="GPU" # Có thể chuyển đổi giữa GPU và CPU tùy nhu cầu
+# --- Các biến cấu hình gốc của bạn ---
+MINING_MODE="DUAL" # Tùy chọn: CPU | GPU | DUAL
 WALLET="prllp6l40ns5k4afu7whzgzmmr9jlczuf2n8s96jaej98rfvhzvus35tsz65jk4"
 WORKER="rig01"
 POOL="asia.rplant.xyz:17168"
 ALGO="pearl"
-
-# Cấu hình đường dẫn (Xử lý triệt để việc ghép chuỗi sinh ra dấu //)
+URL_DOWNLOAD="https://github.com/Printscan/rgminer/releases/download/v0.9.4/rgminer-0.9.4.tar.gz"
 MINER_ROOT="/miners"
-if [ "$MINING_MODE" = "GPU" ]; then
-    MINER_DIR="$MINER_ROOT/gpu/rgminer"
-    WORKER_NAME="${WORKER}-gpu"
-else
-    MINER_DIR="$MINER_ROOT/cpu/rgminer"
-    WORKER_NAME="${WORKER}-cpu"
-fi
-MINER_BIN="$MINER_DIR/rgminer"
 
-# Giao diện hiển thị gốc của bạn
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] 💎 Pearl (PRL) Miner - Chế độ: $MINING_MODE"
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] 🔑 Ví     : $WALLET"
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] 🛠️  Worker : $WORKER_NAME"
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] 🛠️  Worker : $WORKER"
 echo "-------------------------------------------------------"
 
-echo "📦 Cài đặt các gói cần thiết..."
-mkdir -p "$MINER_DIR"
-
-echo "🛠️ --- Thiết lập $MINING_MODE miner (rgminer) ---"
-echo "🔍 Tìm bản mới nhất của rgminer từ GitHub..."
-
-# Link v0.9.4 chuẩn bạn đã kiểm tra
-URL_DOWNLOAD="https://github.com/Printscan/rgminer/releases/download/v0.9.4/rgminer-0.9.4.tar.gz"
-echo "📥 Tải rgminer: $URL_DOWNLOAD"
-
-if [ ! -f "$MINER_BIN" ]; then
-    # Tải file vào thư mục tạm /tmp để tránh rác thư mục chính
-    wget -q --show-progress "$URL_DOWNLOAD" -O /tmp/rgminer.tar.gz
+# --- Hàm đóng gói logic cài đặt (Fix triệt để lỗi lồng thư mục của lệnh tar) ---
+install_miner_setup() {
+    local target_dir=$1
+    local target_bin="$target_dir/rgminer"
     
-    echo "📂 Giải nén gói cài đặt..."
-    # =====================================================================
-    # SỬA LỖI GIẢI NÉN (No such file or directory): 
-    # Thêm --strip-components=1 để ép bung ruột gói tar thẳng vào $MINER_DIR
-    # =====================================================================
-    tar -xzf /tmp/rgminer.tar.gz -C "$MINER_DIR" --strip-components=1 2>/dev/null || \
-    tar -xzf /tmp/rgminer.tar.gz -C "$MINER_DIR"
-    
-    rm -f /tmp/rgminer.tar.gz
-    
-    # Cơ chế dự phòng tự động tìm file thực thi nếu cấu trúc gói đổi
-    if [ ! -f "$MINER_BIN" ]; then
-        FOUND_BIN=$(find "$MINER_DIR" -type f -name "rgminer" | head -n 1)
-        if [ -n "$FOUND_BIN" ]; then
-            mv "$FOUND_BIN" "$MINER_BIN"
+    mkdir -p "$target_dir"
+    if [ ! -f "$target_bin" ]; then
+        echo "📥 Đang tải gói cài đặt vào: $target_dir ..."
+        wget -q --show-progress "$URL_DOWNLOAD" -O /tmp/rgminer.tar.gz
+        
+        echo "📂 Giải nén và làm phẳng cấu trúc thư mục..."
+        # Ép bung thẳng ruột file tar vào đích bằng --strip-components=1
+        tar -xzf /tmp/rgminer.tar.gz -C "$target_dir" --strip-components=1 2>/dev/null || \
+        tar -xzf /tmp/rgminer.tar.gz -C "$target_dir"
+        rm -f /tmp/rgminer.tar.gz
+        
+        # Cơ chế tự tìm kiếm nếu cấu trúc gói thay đổi vị trí file thực thi
+        if [ ! -f "$target_bin" ]; then
+            local found_bin=$(find "$target_dir" -type f -name "rgminer" | head -n 1)
+            if [ -n "$found_bin" ]; then mv "$found_bin" "$target_bin"; fi
+        fi
+        
+        if [ -f "$target_bin" ]; then
+            chmod +x "$target_bin"
+            echo "✅ Cấu hình thành công tại: $target_bin"
+        else
+            echo "❌ Lỗi: Không tìm thấy file thực thi 'rgminer' sau khi giải nén!"
+            exit 1
         fi
     fi
-    
-    # Cấp quyền chạy cho file thực thi
-    if [ -f "$MINER_BIN" ]; then
-        chmod +x "$MINER_BIN"
-        echo "✅ Thiết lập $MINING_MODE miner thành công!"
-    else
-        echo "❌ Lỗi: Không thể cấu hình file thực thi tại $MINER_BIN"
-        exit 1
-    fi
+}
+
+# --- Định tuyến cài đặt theo từng Mode dữ liệu ---
+if [ "$MINING_MODE" = "GPU" ]; then
+    install_miner_setup "$MINER_ROOT/gpu/rgminer"
+elif [ "$MINING_MODE" = "CPU" ]; then
+    install_miner_setup "$MINER_ROOT/cpu/rgminer"
+elif [ "$MINING_MODE" = "DUAL" ]; then
+    echo "⚙️ Thiết lập môi trường chạy song song (DUAL)..."
+    install_miner_setup "$MINER_ROOT/cpu/rgminer"
+    install_miner_setup "$MINER_ROOT/gpu/rgminer"
 fi
 
-# --- Vòng lặp duy trì đào gốc của bạn ---
+# --- Vòng lặp duy trì đào (Auto-Restart) ---
 while true; do
     CURRENT_TIME=$(date '+%Y-%m-%d %H:%M:%S')
-    echo "[$CURRENT_TIME] 🚀 Khởi chạy miner..."
+    echo "[$CURRENT_TIME] 🚀 Kích hoạt miner tiến trình..."
     
-    # Gọi trực tiếp bằng biến đường dẫn tuyệt đối đã được làm sạch
-    "$MINER_BIN" --algo "$ALGO" --stratum "$POOL" --wallet "$WALLET" --worker-name "$WORKER_NAME"
+    if [ "$MINING_MODE" = "GPU" ]; then
+        "$MINER_ROOT/gpu/rgminer/rgminer" --algo "$ALGO" --stratum "$POOL" --wallet "$WALLET" --worker-name "${WORKER}-gpu"
+
+    elif [ "$MINING_MODE" = "CPU" ]; then
+        "$MINER_ROOT/cpu/rgminer/rgminer" --algo "$ALGO" --stratum "$POOL" --wallet "$WALLET" --worker-name "${WORKER}-cpu"
+
+    elif [ "$MINING_MODE" = "DUAL" ]; then
+        echo "⚡ [DUAL] Đang khởi chạy CPU Miner (Chạy ngầm)..."
+        "$MINER_ROOT/cpu/rgminer/rgminer" --algo "$ALGO" --stratum "$POOL" --wallet "$WALLET" --worker-name "${WORKER}-cpu" > /dev/null 2>&1 &
+        CPU_PID=$!
+        
+        echo "⚡ [DUAL] Đang khởi chạy GPU Miner (Tiền cảnh)..."
+        "$MINER_ROOT/gpu/rgminer/rgminer" --algo "$ALGO" --stratum "$POOL" --wallet "$WALLET" --worker-name "${WORKER}-gpu"
+        
+        # Nếu luồng GPU thoát hoặc lỗi, hạ luôn luồng CPU ngầm để đồng bộ khởi động lại toàn container
+        kill $CPU_PID 2>/dev/null || true
+    fi
     
     EXIT_CODE=$?
     CURRENT_TIME=$(date '+%Y-%m-%d %H:%M:%S')
-    echo "⚠️ [$CURRENT_TIME] [$MINING_MODE] Miner thoát (code=$EXIT_CODE). Thử lại sau 5s..."
+    echo "⚠️ [$CURRENT_TIME] [$MINING_MODE] Trình đào tạm thoát (code=$EXIT_CODE). Khởi động lại sau 5s..."
     sleep 5
     echo "-------------------------------------------------------"
 done
