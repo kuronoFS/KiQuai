@@ -17,7 +17,6 @@ echo "=== 4. Khởi chạy đào PRL với cấu hình Stratum chuẩn hóa ==="
 # - Tách biệt rõ ràng --user và --worker để Pool không bẻ gãy kết nối
 # - Bổ sung --pass x để hoàn thiện gói tin handshake gửi tới Luckypool
 ./wildrig-multi --algo pearlhash \
-  --url stratum+tcp://pearl-sg1.luckypool.io:3360 \
-  --user prl1p6l40ns5k4afu7whgzgmmr9jlczuf2n8s96jaej98rfvhzvus35tsz65jk4 \
-  --worker rtx5090 \
+  --url stratum+tcp://stratum.rplant.xyz:7084 \
+  --user prl1p6l40ns5k4afu7whgzgmmr9jlczuf2n8s96jaej98rfvhzvus35tsz65jk4.rtx5090 \
   --pass x
