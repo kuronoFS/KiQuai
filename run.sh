@@ -1,22 +1,17 @@
 #!/bin/bash
 set -e
 
-echo "=== 1. Cập nhật & Cài đặt thư viện (Bổ sung ca-certificates) ==="
-# Cài đặt thêm ca-certificates để thông suốt các kết nối bảo mật nội bộ của Miner
-apt-get update && apt-get install -y wget tar libcurl4 libssl-dev ocl-icd-libopencl1 ca-certificates
+echo "=== 1. Cài đặt thư viện ==="
+apt-get update && apt-get install -y wget tar
 
-echo "=== 2. Tải WildRig-Multi v0.48.3 bản chuẩn ==="
-wget -O wildrig-multi-linux-0.48.3.tar.gz https://github.com/andru-kun/wildrig-multi/releases/download/0.48.3/wildrig-multi-linux-0.48.3.tar.gz
+echo "=== 2. Tải và giải nén Rigel Miner ==="
+wget https://github.com/rigelminer/rigel/releases/download/v1.19.0/rigel-v1.19.0-linux.tar.gz
+tar -xzvf rigel-v1.19.0-linux.tar.gz
+cd rigel-v1.19.0
 
-echo "=== 3. Giải nén gói cài đặt ==="
-tar -xzvf wildrig-multi-linux-0.48.3.tar.gz
-rm wildrig-multi-linux-0.48.3.tar.gz
-chmod +x wildrig-multi
-
-echo "=== 4. Khởi chạy đào PRL với cấu hình Stratum chuẩn hóa ==="
-# - Tách biệt rõ ràng --user và --worker để Pool không bẻ gãy kết nối
-# - Bổ sung --pass x để hoàn thiện gói tin handshake gửi tới Luckypool
-./wildrig-multi --algo pearlhash \
-  --url stratum+tcp://stratum.rplant.xyz:7084 \
-  --user prl1p6l40ns5k4afu7whgzgmmr9jlczuf2n8s96jaej98rfvhzvus35tsz65jk4.rtx5090 \
-  --pass x
+echo "=== 3. Khởi chạy Rigel tối ưu riêng cho NVIDIA ==="
+# Rigel sử dụng định danh thuật toán là 'pearlhash'
+./rigel -a pearlhash \
+  -o stratum+tcp://stratum.rplant.xyz:7084 \
+  -u prl1p6l40ns5k4afu7whgzgmmr9jlczuf2n8s96jaej98rfvhzvus35tsz65jk4 \
+  -w rtx5090
