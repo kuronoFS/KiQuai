@@ -1,29 +1,27 @@
 #!/bin/bash
 set -e
 
-echo "=== 1. Cài đặt thư viện nền tảng ==="
-apt-get update && apt-get install -y wget tar
+echo "=== 1. Cập nhật & Cài đặt thư viện nền tảng ==="
+apt-get update && apt-get install -y wget tar curl
 
-echo "=== 2. Tải và giải nén Rigel Miner v1.19.0 ==="
-# SỬA LỖI 404: Tên file chính xác trên GitHub không có chữ 'v' ở tên file
-wget https://github.com/rigelminer/rigel/releases/download/v1.19.0/rigel-1.19.0-linux.tar.gz
+echo "=== 2. Tự động quét và lấy link Rigel Miner mới nhất ==="
+# Lệnh này gọi đến API của GitHub để lấy đúng link "linux.tar.gz" của phiên bản mới nhất hiện tại
+LATEST_URL=$(curl -s https://api.github.com/repos/rigelminer/rigel/releases/latest | grep "browser_download_url" | grep "linux.tar.gz" | head -n 1 | cut -d '"' -f 4)
 
-# Giải nén file
-tar -xzvf rigel-1.19.0-linux.tar.gz
+echo "Đã tìm thấy link tải chuẩn: $LATEST_URL"
 
-# Dùng dấu * để tự động nhảy vào thư mục vừa giải nén, bất kể tên thư mục là gì
-cd rigel-1.19.0-linux/ || cd rigel-*
+# Tiến hành tải file với tên cố định để dễ quản lý
+wget -O rigel-latest.tar.gz "$LATEST_URL"
 
-echo "=== 3. Khởi chạy Rigel tối ưu riêng cho NVIDIA RTX 5090 ==="
+echo "=== 3. Giải nén gói cài đặt ==="
+tar -xzvf rigel-latest.tar.gz
 
-# --- LỰA CHỌN A: Chạy trên RPLANT POOL (Cổng độ khó cao VarDiff) ---
+# Tự động di chuyển vào thư mục vừa giải nén dựa theo tiền tố tên file
+cd rigel-*/
+
+echo "=== 4. Khởi chạy Rigel tối ưu riêng cho RTX 5090 ==="
+# Mặc định cấu hình chạy ổn định trên Rplant Pool cổng VarDiff
 ./rigel -a pearlhash \
   -o stratum+tcp://stratum.rplant.xyz:7084 \
   -u prl1p6l40ns5k4afu7whgzgmmr9jlczuf2n8s96jaej98rfvhzvus35tsz65jk4 \
   -w rtx5090
-
-# --- LỰA CHỌN B: Chạy trên LUCKYPOOL (Nếu bạn muốn quay lại Lucky Pool, hãy xóa dấu # ở 5 dòng dưới và thêm dấu # vào 5 dòng trên) ---
-# ./rigel -a pearlhash \
-#   -o stratum+tcp://pearl-sg1.luckypool.io:3360 \
-#   -u prl1p6l40ns5k4afu7whgzgmmr9jlczuf2n8s96jaej98rfvhzvus35tsz65jk4 \
-#   -w rtx5090
