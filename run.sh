@@ -25,7 +25,7 @@ die()  { log "❌  $*"; exit 1; }
 
 install_deps() {
     log "📦  Cài đặt các gói cần thiết..."
-    apt-get update -qq && apt-get install -y -qq wget tar curl procps >/dev/null 2>&1
+    apt-get update -qq && apt-get install -y -qq wget tar curl procps 2>&1 | tail -1
 }
 
 # ─── Tải & giải nén miner ───────────────────────────────────────────────────
@@ -75,7 +75,7 @@ run_miner_loop() {
         local exit_code=$?
 
         retries=$((retries + 1))
-        if [[ "$MAX_RETRIES" -gt 0 && "$retries" -ge "$MAX_RETRIES" ]]; then
+        if [[ "$MAX_RETRIES" -gt 0 && "$retries" -gt "$MAX_RETRIES" ]]; then
             log "🛑  [${label}] Đã vượt quá ${MAX_RETRIES} lần thử. Dừng."
             break
         fi
@@ -145,9 +145,14 @@ start_cpu_miner() {
 
 # ─── Dọn dẹp khi nhận tín hiệu thoát ───────────────────────────────────────
 cleanup() {
-    log "🧹  Đang dừng tất cả miner..."
-    kill 0 2>/dev/null || true
-    wait 2>/dev/null || true
+    log "🧹  Đang dừng tất cả miner con..."
+    # Dừng các tiến trình con của script này
+    local children
+    children=$(jobs -p 2>/dev/null) || true
+    if [[ -n "$children" ]]; then
+        kill $children 2>/dev/null || true
+        wait $children 2>/dev/null || true
+    fi
     log "✅  Đã dừng."
     exit 0
 }
