@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-#  Ollama Server Entrypoint — SRBMiner-style config block at the top
+#  Ollama Server Entrypoint
 #  Supports GPU (NVIDIA CUDA) and CPU-only mode.
 #
 #  All settings can be overridden by environment variables at runtime:
@@ -15,7 +15,7 @@ set -euo pipefail
 # ----------------------------------------------------------------------------
 # [SCRIPT VERSION] — bump this every time you make changes
 # ----------------------------------------------------------------------------
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.2.0"
 SCRIPT_BUILD_DATE="2026-06-22"
 
 # ============================================================================
@@ -23,23 +23,27 @@ SCRIPT_BUILD_DATE="2026-06-22"
 # ============================================================================
 
 # --- Server ---
-# Address and port Ollama listens on.
-# Must be 0.0.0.0:<port> (not 127.0.0.1) so that reverse proxies
-# (Nginx Proxy Manager, Traefik, etc.) can reach it from outside the container.
-OLLAMA_HOST="${OLLAMA_HOST:-0.0.0.0:45000}"
+# Address Ollama binds to. MUST be 0.0.0.0 (not 127.0.0.1) so traffic can
+# reach the container from outside (reverse proxy, direct access, etc.).
+OLLAMA_BIND_ADDR="${OLLAMA_BIND_ADDR:-0.0.0.0}"
+
+# Port Ollama listens on.
+# Make sure your docker run / docker-compose exposes this same port:
+#   docker run -p 45000:45000 ...
+OLLAMA_PORT="${OLLAMA_PORT:-45000}"
 
 # --- Model pre-pull (optional) ---
-# Space-separated list of models to download on first start.
+# Space-separated list of models to download before the server starts serving.
 # Leave empty ("") to skip pre-pulling entirely.
 # Examples: "qwen2.5:7b"  |  "llama3.2 mistral:7b"  |  ""
-OLLAMA_MODELS="${OLLAMA_MODELS:-gemma4:26b}"
+OLLAMA_MODELS="${OLLAMA_MODELS:-}"
 
 # Seconds to wait for each model pull before giving up (0 = no timeout).
 OLLAMA_PULL_TIMEOUT="${OLLAMA_PULL_TIMEOUT:-300}"
 
 # --- Keep-alive ---
-# How long Ollama keeps a model loaded in memory after the last request.
-# Examples: "5m"  |  "1h"  |  "0"  (0 = unload immediately)  |  "-1" (never unload)
+# How long Ollama keeps a model loaded in VRAM after the last request.
+# Examples: "5m"  |  "1h"  |  "0" (unload immediately)  |  "-1" (never unload)
 OLLAMA_KEEP_ALIVE="${OLLAMA_KEEP_ALIVE:-5m}"
 
 # --- GPU memory (optional) ---
@@ -52,11 +56,11 @@ OLLAMA_GPU_MEMORY_FRACTION="${OLLAMA_GPU_MEMORY_FRACTION:-}"
 # Leave empty ("") to use Ollama's default.
 OLLAMA_NUM_PARALLEL="${OLLAMA_NUM_PARALLEL:-}"
 
-# --- Restart / debug ---
-# Set to 1 to enable verbose [DEBUG] log lines in this script.
+# --- Debug ---
+# Set to 1 to show verbose [DEBUG] log lines from this script.
 DEBUG="${DEBUG:-0}"
 
-# Seconds to wait for the API to become ready before declaring failure.
+# Seconds to wait for the API to become ready during model pre-pull.
 API_READY_TIMEOUT="${API_READY_TIMEOUT:-60}"
 
 # ============================================================================
@@ -89,39 +93,38 @@ if [ "${1:-}" = "--version" ] || [ "${1:-}" = "-v" ]; then
 fi
 
 # ----------------------------------------------------------------------------
+# Build the full OLLAMA_HOST string from BIND_ADDR + PORT
+# Keeping them separate avoids ambiguity and makes the port easy to change.
+# ----------------------------------------------------------------------------
+OLLAMA_HOST="${OLLAMA_BIND_ADDR}:${OLLAMA_PORT}"
+
+# Export ALL Ollama env vars NOW, before any 'ollama' command is executed,
+# so both the pre-pull server and the final server inherit the same config.
+export OLLAMA_HOST
+export OLLAMA_KEEP_ALIVE
+[ -n "$OLLAMA_GPU_MEMORY_FRACTION" ] && export OLLAMA_GPU_MEMORY_FRACTION || true
+[ -n "$OLLAMA_NUM_PARALLEL" ]        && export OLLAMA_NUM_PARALLEL        || true
+
+# ----------------------------------------------------------------------------
 # Banner
 # ----------------------------------------------------------------------------
 hr
 echo "  🦙  Ollama Server Entrypoint"
 echo "  📌  Script version : v$SCRIPT_VERSION (build $SCRIPT_BUILD_DATE)"
 hr
-
-log_debug "OLLAMA_HOST=$OLLAMA_HOST"
-log_debug "OLLAMA_MODELS=${OLLAMA_MODELS:-(none)}"
-log_debug "OLLAMA_KEEP_ALIVE=$OLLAMA_KEEP_ALIVE"
-log_debug "OLLAMA_PULL_TIMEOUT=${OLLAMA_PULL_TIMEOUT}s"
-log_debug "OLLAMA_GPU_MEMORY_FRACTION=${OLLAMA_GPU_MEMORY_FRACTION:-(auto)}"
-log_debug "OLLAMA_NUM_PARALLEL=${OLLAMA_NUM_PARALLEL:-(auto)}"
-log_debug "API_READY_TIMEOUT=${API_READY_TIMEOUT}s"
-
-# Derive numeric port from OLLAMA_HOST for readiness probe
-case "$OLLAMA_HOST" in
-    *:*) OLLAMA_PORT="${OLLAMA_HOST##*:}" ;;
-    *)   OLLAMA_PORT="11434" ;;
-esac
-
-# Export Ollama env vars so the 'ollama serve' process inherits them
-export OLLAMA_HOST
-export OLLAMA_KEEP_ALIVE
-[ -n "$OLLAMA_GPU_MEMORY_FRACTION" ] && export OLLAMA_GPU_MEMORY_FRACTION
-[ -n "$OLLAMA_NUM_PARALLEL" ]        && export OLLAMA_NUM_PARALLEL
+log_info "Listen address  : ${OLLAMA_HOST}"
+log_info "Pre-pull models : ${OLLAMA_MODELS:-(none)}"
+log_info "Keep-alive      : ${OLLAMA_KEEP_ALIVE}"
+log_debug "OLLAMA_PULL_TIMEOUT   : ${OLLAMA_PULL_TIMEOUT}s"
+log_debug "OLLAMA_GPU_MEMORY_FRACTION : ${OLLAMA_GPU_MEMORY_FRACTION:-(auto)}"
+log_debug "OLLAMA_NUM_PARALLEL        : ${OLLAMA_NUM_PARALLEL:-(auto)}"
+log_debug "API_READY_TIMEOUT          : ${API_READY_TIMEOUT}s"
 
 # ============================================================================
 #  STEP 1 — Install system dependencies
 #
-#  Ollama's install.sh fetches a .tar.zst archive. Without zstd the extraction
-#  fails immediately with "zstd: command not found".
-#  We also need curl, tar, and ca-certificates.
+#  Ollama's install.sh fetches a .tar.zst archive — without 'zstd' the
+#  extraction fails with "zstd: command not found". Install it first.
 # ============================================================================
 log_step 1 "Installing system dependencies"
 
@@ -182,17 +185,22 @@ else
 fi
 
 # ============================================================================
-#  STEP 4 — (Optional) pre-pull models, then launch server
+#  STEP 4 — (Optional) pre-pull models, then launch server as PID 1
 # ============================================================================
 log_step 4 "Starting Ollama server"
 
 if [ -n "$OLLAMA_MODELS" ]; then
     log_info "OLLAMA_MODELS='$OLLAMA_MODELS' — starting temporary server for pre-pull..."
 
-    # Temporary background server just for pulling
+    # Start a background server to do the pulls.
+    # OLLAMA_HOST is already exported above, so this server binds to the
+    # correct address/port (e.g. 0.0.0.0:45000) right away.
     ollama serve &
     SERVE_PID=$!
 
+    # Wait for the API to respond before attempting pulls.
+    # We probe 127.0.0.1 (loopback) regardless of OLLAMA_BIND_ADDR because
+    # we are on the same host as the server process.
     log_info "Waiting up to ${API_READY_TIMEOUT}s for Ollama API on port ${OLLAMA_PORT}..."
     READY=0
     for _i in $(seq 1 "$API_READY_TIMEOUT"); do
@@ -205,15 +213,15 @@ if [ -n "$OLLAMA_MODELS" ]; then
     if [ "$READY" -ne 1 ]; then
         kill "$SERVE_PID" 2>/dev/null || true
         wait "$SERVE_PID" 2>/dev/null || true
-        die "Ollama API did not respond within ${API_READY_TIMEOUT}s. Check for port conflicts or errors above."
+        die "Ollama API did not respond on port ${OLLAMA_PORT} within ${API_READY_TIMEOUT}s. Check for port conflicts or errors above."
     fi
     log_info "API is ready."
 
     for model in $OLLAMA_MODELS; do
         log_info "Pulling model: $model  (timeout: ${OLLAMA_PULL_TIMEOUT}s)..."
-        if [ "$OLLAMA_PULL_TIMEOUT" -gt 0 ] 2>/dev/null && command -v timeout >/dev/null 2>&1; then
+        if [ "${OLLAMA_PULL_TIMEOUT}" -gt 0 ] 2>/dev/null && command -v timeout >/dev/null 2>&1; then
             timeout "$OLLAMA_PULL_TIMEOUT" ollama pull "$model" \
-                || log_warn "Could not pull '$model' — skipping (check name or network)."
+                || log_warn "Could not pull '$model' — skipping (check model name or network)."
         else
             ollama pull "$model" \
                 || log_warn "Could not pull '$model' — skipping."
@@ -232,9 +240,13 @@ fi
 # Launch Ollama as PID 1
 #
 # 'exec' replaces this shell with 'ollama serve' so that:
-#   - Docker SIGTERM (from 'docker stop') is delivered directly to Ollama
+#   - Docker SIGTERM ('docker stop') is delivered directly to Ollama
 #   - No orphan shell process lingers
 #   - Ollama handles its own graceful shutdown
+#
+# OLLAMA_HOST is already exported, so Ollama picks it up automatically.
+# No need to pass --host on the command line.
 # ----------------------------------------------------------------------------
-log_info "🚀 Launching Ollama server on ${OLLAMA_HOST} ..."
+log_info "🚀 Launching Ollama server — listening on ${OLLAMA_HOST} ..."
+log_info "   Access from other machines: http://<host-ip>:${OLLAMA_PORT}/api/tags"
 exec ollama serve
