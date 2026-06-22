@@ -36,7 +36,7 @@ OLLAMA_PORT="${OLLAMA_PORT:-45000}"
 # Space-separated list of models to download before the server starts serving.
 # Leave empty ("") to skip pre-pulling entirely.
 # Examples: "qwen2.5:7b"  |  "llama3.2 mistral:7b"  |  ""
-OLLAMA_MODELS="${OLLAMA_MODELS:-}"
+OLLAMA_MODELS="${OLLAMA_MODELS:-gemma4:26b}"
 
 # Seconds to wait for each model pull before giving up (0 = no timeout).
 OLLAMA_PULL_TIMEOUT="${OLLAMA_PULL_TIMEOUT:-300}"
