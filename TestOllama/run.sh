@@ -26,13 +26,13 @@ SCRIPT_BUILD_DATE="2026-06-22"
 # Address and port Ollama listens on.
 # Must be 0.0.0.0:<port> (not 127.0.0.1) so that reverse proxies
 # (Nginx Proxy Manager, Traefik, etc.) can reach it from outside the container.
-OLLAMA_HOST="${OLLAMA_HOST:-0.0.0.0:11434}"
+OLLAMA_HOST="${OLLAMA_HOST:-0.0.0.0:45000}"
 
 # --- Model pre-pull (optional) ---
 # Space-separated list of models to download on first start.
 # Leave empty ("") to skip pre-pulling entirely.
 # Examples: "qwen2.5:7b"  |  "llama3.2 mistral:7b"  |  ""
-OLLAMA_MODELS="${OLLAMA_MODELS:-}"
+OLLAMA_MODELS="${OLLAMA_MODELS:-gemma4:26b}"
 
 # Seconds to wait for each model pull before giving up (0 = no timeout).
 OLLAMA_PULL_TIMEOUT="${OLLAMA_PULL_TIMEOUT:-300}"
