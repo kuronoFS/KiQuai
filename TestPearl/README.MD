@@ -1,80 +1,83 @@
 # Pearl (PRL) Modular Mining Script
 
-Script đào Pearl (PRL) all-in-one — dễ cấu hình, hỗ trợ GPU, CPU, hoặc cả hai đồng thời.
+An all-in-one Pearl (PRL) mining script — easy to configure, supports GPU, CPU, or both simultaneously.
 
-## Cấu trúc
+## Structure
 
 ```
-├── run.sh       ← Script chính (cấu hình ở đầu file)
-└── README.md    ← Tài liệu hướng dẫn
+├── run.sh       ← Main script (configuration at the top of the file)
+└── README.MD    ← Documentation
 ```
 
-## Bắt đầu nhanh
+## Quick Start
 
-### 1. Cấu hình
-Mở `run.sh` và chỉnh sửa phần **⚙️ CẤU HÌNH** ở đầu file:
+### 1. Configure
+Open `run.sh` and edit the **⚙️ CONFIGURATION** section at the top of the file:
 
 ```bash
-# Chọn chế độ đào
+# Select mining mode
 MINING_MODE="gpu"          # gpu | cpu | dual
 
-# Địa chỉ ví PRL
+# PRL wallet address
 WALLET="prl1..."
 
-# Tên worker
+# Worker name
 WORKER_NAME="rig01"
 ```
 
-### 2. Chạy
+### 2. Run
 
 ```bash
 chmod +x run.sh
 sudo ./run.sh
 ```
 
-## Chế độ đào
+## Mining Modes
 
-| Chế độ | Mô tả | Miner sử dụng |
-|--------|--------|----------------|
-| `gpu`  | Chỉ đào bằng GPU (NVIDIA CUDA) | rgminer |
-| `cpu`  | Chỉ đào bằng CPU | bzminer (beta) |
-| `dual` | Đào đồng thời GPU + CPU | rgminer + bzminer |
+| Mode   | Description                          | Miner used              |
+|--------|--------------------------------------|-------------------------|
+| `gpu`  | GPU-only mining (NVIDIA CUDA)        | SRBMiner-Multi          |
+| `cpu`  | CPU-only mining                      | SRBMiner-Multi (beta)   |
+| `dual` | Simultaneous GPU + CPU mining        | SRBMiner-Multi (both)   |
 
-## Cấu hình chi tiết (trong `run.sh`)
+## Detailed Configuration (inside `run.sh`)
 
-### GPU (rgminer)
-| Tham số | Mô tả | Mặc định |
-|---------|--------|----------|
-| `GPU_ALGO` | Thuật toán | `pearl` |
-| `GPU_POOL` | Địa chỉ pool | `asia.rplant.xyz:17168` |
-| `GPU_PEARL_BATCH` | Batch size (để trống = mặc định) | `""` |
+### GPU (SRBMiner-Multi)
+| Parameter | Description | Default |
+|---|---|---|
+| `GPU_ALGO` | Algorithm | `pearlhash` |
+| `GPU_POOL` | Pool address | `pearl-sg1.luckypool.io:3360` |
+| `GPU_TH_EST` | Estimated TH/s per GPU (used to auto-select port) | `350` |
 
-### CPU (bzminer)
-| Tham số | Mô tả | Mặc định |
-|---------|--------|----------|
-| `CPU_ALGO` | Thuật toán | `pearl` |
-| `CPU_POOL` | Địa chỉ pool | `stratum+tcp://pearl-asia1.luckypool.io:3360` |
-| `CPU_THREADS` | Số luồng (`"auto"` = tự phát hiện) | `"auto"` |
-| `CPU_THREADS_CACHE_GROUP` | Cache group cho bzminer | `3` |
+### CPU (SRBMiner-Multi)
+| Parameter | Description | Default |
+|---|---|---|
+| `CPU_ALGO` | Algorithm | `pearlhash` |
+| `CPU_POOL` | Pool address | `pearl-sg1.luckypool.io:3360` |
+| `CPU_THREADS` | Thread count (`"auto"` = auto-detect) | `"auto"` |
 
-### Khởi động lại
-| Tham số | Mô tả | Mặc định |
-|---------|--------|----------|
-| `RESTART_DELAY` | Giây chờ trước khi restart | `5` |
-| `MAX_RETRIES` | Số lần thử tối đa (0 = vô hạn) | `0` |
+### Restart Behavior
+| Parameter | Description | Default |
+|---|---|---|
+| `RESTART_DELAY` | Seconds to wait before restarting | `5` |
+| `MAX_RETRIES` | Maximum number of attempts (0 = unlimited) | `0` |
+| `LONG_RESTART_DELAY` | Wait time after repeated fast crashes | `60` |
 
-## Lưu ý quan trọng
+## Important Notes
 
-- **GPU mining (rgminer)**: Chỉ hỗ trợ NVIDIA GPU với CUDA. RTX 30/40/50 series hoạt động tốt nhất.
-- **CPU mining (bzminer)**: Đang ở giai đoạn beta. Hiệu suất thấp hơn GPU rất nhiều. Cần CPU hỗ trợ AVX512 để đạt hiệu quả tốt nhất.
-- **Chế độ dual**: Có thể chạy đồng thời cả GPU và CPU. Mỗi miner chạy như một tiến trình riêng biệt. Nhấn `Ctrl+C` để dừng cả hai.
-- Script tự động tải phiên bản miner mới nhất từ GitHub mỗi lần chạy.
+- **GPU mining (SRBMiner-Multi):** Requires an NVIDIA GPU with CUDA. RTX 30/40/50 series work best. Driver ≥ 580 is recommended for `pearlhash`; RTX 50xx (Blackwell) requires at least driver branch 570.
+- **CPU mining:** Currently in beta. Performance is significantly lower than GPU mining.
+- **Dual mode:** Runs GPU and CPU mining simultaneously as separate processes. Press `Ctrl+C` to stop both.
+- The script automatically downloads the latest supported miner version from GitHub on each run unless already installed.
+- GPUs run at **stock clocks** — the script does not apply any overclocking or power limits.
 
-## Pools gợi ý
+## Suggested Pools
 
-| Pool | Địa chỉ | Ghi chú |
-|------|---------|---------|
+| Pool | Address | Notes |
+|---|---|---|
+| LuckyPool (Singapore) | `pearl-sg1.luckypool.io:3360` | Primary (GPU + CPU) |
+| LuckyPool (Singapore 2) | `pearl-sg2.luckypool.io:3360` | Failover |
+| LuckyPool (Europe) | `pearl-eu2.luckypool.io:3360` | Failover |
 | rplant (Asia) | `asia.rplant.xyz:17168` | GPU |
-| LuckyPool (Asia) | `stratum+tcp://pearl-asia1.luckypool.io:3360` | CPU + GPU |
 | AkoyaPool | `pool.akoyapool.com:3333` | GPU |
 | AlphaPool | `pearl.alphapool.tech` | GPU + AMD |
