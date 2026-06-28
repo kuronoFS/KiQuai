@@ -87,7 +87,7 @@ NO_SHARE_RESTART="${NO_SHARE_RESTART:-900}"  # Seconds without accepted share =>
 #       -e NVIDIA_DRIVER_CAPABILITIES=compute,utility
 #   - Setting power limit may require root/admin privileges on the host/container.
 GPU_POWER_MODE="${GPU_POWER_MODE:-percent}"
-GPU_POWER_PERCENT="${GPU_POWER_PERCENT:-80}"
+GPU_POWER_PERCENT="${GPU_POWER_PERCENT:-70}"
 GPU_POWER_MINUS_W="${GPU_POWER_MINUS_W:-100}"
 GPU_POWER_LIMIT_W="${GPU_POWER_LIMIT_W:-}"
 GPU_POWER_PERSISTENCE="${GPU_POWER_PERSISTENCE:-1}"
