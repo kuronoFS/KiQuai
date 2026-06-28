@@ -4,8 +4,12 @@
 #  Default Pool: LuckyPool Asia (pearl-sg1.luckypool.io, Singapore)
 # ----------------------------------------------------------------------------
 #  - Auto-downloads, verifies (MD5/ELF/arch) and runs SRBMiner-MULTI, logs each step.
-#  - GPU runs STOCK — script does NOT intervene with clock/power limit (prioritizes
-#    stability, temperature). Thermal protection via --gpu-off-temperature (default 90°C).
+#  - GPU power limiting is OPTIONAL via environment variables:
+#       GPU_POWER_MODE=off|percent|minus|fixed
+#       GPU_POWER_MODE=percent GPU_POWER_PERCENT=80      => cap at 80% of default/TDP
+#       GPU_POWER_MODE=minus   GPU_POWER_MINUS_W=100     => cap at default/TDP minus 100W
+#       GPU_POWER_MODE=fixed   GPU_POWER_LIMIT_W=350     => cap at exactly 350W
+#    Thermal protection remains available via --gpu-off-temperature (default 90°C).
 #  - All config variables can be overridden via environment variables when running:
 #       WALLET=prl1... WORKER=rig02 DEBUG=0 ./run.sh
 #       curl -fsSL <url>/run.sh | WORKER=rig02 bash
@@ -18,9 +22,12 @@ set -E   # Allow ERR trap to work inside functions
 # ----------------------------------------------------------------------------
 # [SCRIPT VERSION] — increment this number each time you edit the code
 # ----------------------------------------------------------------------------
-SCRIPT_VERSION="3.0.1"
-SCRIPT_BUILD_DATE="2026-06-12"
+SCRIPT_VERSION="3.1.0"
+SCRIPT_BUILD_DATE="2026-06-28"
 # CHANGELOG:
+#  3.1.0: ADD optional NVIDIA GPU power limiting before miner launch. Supports
+#         percent of default/TDP, default/TDP minus watts, or fixed watts.
+#         Controlled by GPU_POWER_MODE=off|percent|minus|fixed.
 #  3.0.1: FIX smoke test: '--list-algorithms' of SRBMiner outputs NOTHING when
 #         stdout is not a TTY (running in docker) => script wrongly concluded
 #         "no pearlhash support" and stopped. Now only WARN and continue.
@@ -29,7 +36,7 @@ SCRIPT_BUILD_DATE="2026-06-12"
 #  3.0.0: SWITCHED to SRBMiner-Multi 3.3.7 (algorithm 'pearlhash') +
 #         LuckyPool Asia (pearl-sg1.luckypool.io, failover sg2/eu2).
 #         Auto-selects port 3360/3361/3362 based on estimated hashrate (GPU count ×
-#         GPU_TH_EST). GPU runs STOCK — no OC. Monitoring API on port 21550.
+#         GPU_TH_EST). GPU runs stock unless optional GPU_POWER_MODE is enabled. Monitoring API on port 21550.
 #         Removed all launcher/cache/Plan B logic from rgminer and CPU/DUAL modes.
 #  2.x  : versions using rgminer + rplant (deprecated).
 
@@ -59,6 +66,31 @@ API_ENABLE="${API_ENABLE:-1}"            # 1 = enable stats API (http://<host>:A
 API_PORT="${API_PORT:-21550}"
 GPU_OFF_TEMP="${GPU_OFF_TEMP:-90}"       # GPU exceeds N°C => miner auto-disables that GPU (0 = disable feature)
 NO_SHARE_RESTART="${NO_SHARE_RESTART:-900}"  # Seconds without accepted share => miner auto-restarts (0 = disable)
+
+# ----------------------------------------------------------------------------
+# [GPU POWER LIMIT] — optional NVIDIA power cap, applied before miner launch
+# ----------------------------------------------------------------------------
+# GPU_POWER_MODE options:
+#   off     = do not change GPU power limit
+#   percent = target = default/TDP × GPU_POWER_PERCENT / 100
+#   minus   = target = default/TDP - GPU_POWER_MINUS_W
+#   fixed   = target = GPU_POWER_LIMIT_W
+#
+# Examples:
+#   GPU_POWER_MODE=percent GPU_POWER_PERCENT=80 ./run.sh
+#   GPU_POWER_MODE=minus GPU_POWER_MINUS_W=100 ./run.sh
+#   GPU_POWER_MODE=fixed GPU_POWER_LIMIT_W=350 ./run.sh
+#
+# Notes:
+#   - Values are clamped to each GPU's NVIDIA min/max power-limit range.
+#   - In Docker, run with --gpus all and expose NVIDIA utility capability:
+#       -e NVIDIA_DRIVER_CAPABILITIES=compute,utility
+#   - Setting power limit may require root/admin privileges on the host/container.
+GPU_POWER_MODE="${GPU_POWER_MODE:-percent}"
+GPU_POWER_PERCENT="${GPU_POWER_PERCENT:-80}"
+GPU_POWER_MINUS_W="${GPU_POWER_MINUS_W:-100}"
+GPU_POWER_LIMIT_W="${GPU_POWER_LIMIT_W:-}"
+GPU_POWER_PERSISTENCE="${GPU_POWER_PERSISTENCE:-1}"
 
 # ----------------------------------------------------------------------------
 # [MINER CONFIGURATION] — Official SRBMiner-Multi: github.com/doktor83/SRBMiner-Multi
@@ -181,6 +213,114 @@ sha256_of() { sha256sum "$1" 2>/dev/null | awk '{print $1}'; }
 
 # Compare versions in a.b.c format — version_ge A B means A >= B
 version_ge() { [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)" = "$2" ]; }
+
+# Return success if value looks like a positive decimal number.
+is_positive_number() {
+    awk -v v="$1" 'BEGIN { exit !(v ~ /^[0-9]+([.][0-9]+)?$/ && v > 0) }'
+}
+
+# Apply optional NVIDIA GPU power limit via nvidia-smi before the miner starts.
+# This is the most reliable way to enforce lower power draw inside Docker because
+# Docker has no native GPU-TDP quota knob.
+apply_gpu_power_limit() {
+    if [ "$GPU_POWER_MODE" = "off" ]; then
+        log_info "GPU power limit: disabled — using current/default GPU power limit."
+        return 0
+    fi
+
+    case "$GPU_POWER_MODE" in
+        percent|minus|fixed) ;;
+        *)
+            log_warn "Invalid GPU_POWER_MODE='$GPU_POWER_MODE' — use off|percent|minus|fixed. Skipping GPU power limit."
+            return 0
+            ;;
+    esac
+
+    if ! command -v nvidia-smi >/dev/null 2>&1; then
+        log_warn "GPU_POWER_MODE=$GPU_POWER_MODE requested, but nvidia-smi was not found. Skipping GPU power limit."
+        log_warn "Docker hint: run with --gpus all and -e NVIDIA_DRIVER_CAPABILITIES=compute,utility"
+        return 0
+    fi
+
+    if [ "$GPU_POWER_MODE" = "fixed" ] && [ -z "${GPU_POWER_LIMIT_W:-}" ]; then
+        log_warn "GPU_POWER_MODE=fixed requires GPU_POWER_LIMIT_W, e.g. GPU_POWER_LIMIT_W=350. Skipping GPU power limit."
+        return 0
+    fi
+
+    if [ "$GPU_POWER_MODE" = "fixed" ] && ! is_positive_number "$GPU_POWER_LIMIT_W"; then
+        log_warn "GPU_POWER_LIMIT_W='$GPU_POWER_LIMIT_W' is not a positive number. Skipping GPU power limit."
+        return 0
+    fi
+    if [ "$GPU_POWER_MODE" = "percent" ] && ! is_positive_number "$GPU_POWER_PERCENT"; then
+        log_warn "GPU_POWER_PERCENT='$GPU_POWER_PERCENT' is not a positive number. Skipping GPU power limit."
+        return 0
+    fi
+    if [ "$GPU_POWER_MODE" = "minus" ] && ! is_positive_number "$GPU_POWER_MINUS_W"; then
+        log_warn "GPU_POWER_MINUS_W='$GPU_POWER_MINUS_W' is not a positive number. Skipping GPU power limit."
+        return 0
+    fi
+
+    if [ "$GPU_POWER_PERSISTENCE" = "1" ]; then
+        nvidia-smi -pm ENABLED >/dev/null 2>&1 || \
+            log_warn "Could not enable NVIDIA persistence mode. Continuing with power-limit attempt."
+    fi
+
+    local query rc
+    rc=0
+    query=$(nvidia-smi --query-gpu=index,name,power.default_limit,power.min_limit,power.max_limit --format=csv,noheader,nounits 2>&1) || rc=$?
+    if [ "$rc" -ne 0 ] || [ -z "$query" ]; then
+        log_warn "Cannot query GPU power-limit range with nvidia-smi. Output: $query"
+        log_warn "Docker hint: add -e NVIDIA_DRIVER_CAPABILITIES=compute,utility"
+        return 0
+    fi
+
+    log_info "Applying GPU power policy: mode=$GPU_POWER_MODE percent=${GPU_POWER_PERCENT}% minus=${GPU_POWER_MINUS_W}W fixed=${GPU_POWER_LIMIT_W:-unset}W"
+
+    echo "$query" | while IFS=',' read -r gpu name def min max; do
+        gpu=$(echo "$gpu" | sed 's/^ *//;s/ *$//')
+        name=$(echo "$name" | sed 's/^ *//;s/ *$//')
+        def=$(echo "$def" | sed 's/^ *//;s/ *$//')
+        min=$(echo "$min" | sed 's/^ *//;s/ *$//')
+        max=$(echo "$max" | sed 's/^ *//;s/ *$//')
+
+        if ! is_positive_number "$def" || ! is_positive_number "$min" || ! is_positive_number "$max"; then
+            log_warn "GPU $gpu ($name): power-limit data unavailable/invalid: default='$def' min='$min' max='$max'. Skipping this GPU."
+            continue
+        fi
+
+        local target
+        target=$(awk \
+            -v mode="$GPU_POWER_MODE" \
+            -v pct="$GPU_POWER_PERCENT" \
+            -v minus="$GPU_POWER_MINUS_W" \
+            -v fixed="$GPU_POWER_LIMIT_W" \
+            -v def="$def" \
+            -v min="$min" \
+            -v max="$max" '
+            BEGIN {
+                if (mode == "percent")      t = def * pct / 100.0;
+                else if (mode == "minus")   t = def - minus;
+                else if (mode == "fixed")   t = fixed;
+                else exit 1;
+
+                if (t < min) t = min;
+                if (t > max) t = max;
+                printf "%.0f", t;
+            }'
+        )
+
+        if [ -z "$target" ] || ! is_positive_number "$target"; then
+            log_warn "GPU $gpu ($name): failed to calculate target power limit. Skipping this GPU."
+            continue
+        fi
+
+        if nvidia-smi -i "$gpu" -pl "$target" >/dev/null 2>&1; then
+            log_info "✅ GPU $gpu ($name): power limit set to ${target}W (default=${def}W, min=${min}W, max=${max}W)"
+        else
+            log_warn "GPU $gpu ($name): failed to set power limit to ${target}W. Need root/admin rights or host-level permission."
+        fi
+    done
+}
 
 # Print full information about 1 file to know exactly what it is / where it's broken
 dump_file_info() {
@@ -311,6 +451,11 @@ ensure_number GPU_TH_EST 350
 ensure_number API_PORT 21550
 ensure_number GPU_OFF_TEMP 90
 ensure_number NO_SHARE_RESTART 900
+ensure_number GPU_POWER_PERCENT 80
+ensure_number GPU_POWER_MINUS_W 100
+if [ -n "$GPU_POWER_LIMIT_W" ]; then
+    ensure_number GPU_POWER_LIMIT_W 0
+fi
 
 log_info "WALLET        : $WALLET"
 log_info "WORKER        : $WORKER"
@@ -321,13 +466,24 @@ else
     log_info "POOL          : (auto-select) $POOL_HOST + failover: $POOL_FAILOVER_HOSTS"
     log_info "                port will be chosen at STEP 4 based on GPU count × ${GPU_TH_EST} TH/s"
 fi
-log_info "GPU           : running STOCK — script does not OC/adjust clock, power limit"
+if [ "$GPU_POWER_MODE" = "off" ]; then
+    log_info "GPU POWER     : off (stock/default power limit)"
+elif [ "$GPU_POWER_MODE" = "percent" ]; then
+    log_info "GPU POWER     : percent mode — cap at ${GPU_POWER_PERCENT}% of default/TDP"
+elif [ "$GPU_POWER_MODE" = "minus" ]; then
+    log_info "GPU POWER     : minus mode — cap at default/TDP minus ${GPU_POWER_MINUS_W}W"
+elif [ "$GPU_POWER_MODE" = "fixed" ]; then
+    log_info "GPU POWER     : fixed mode — cap at ${GPU_POWER_LIMIT_W:-UNSET}W"
+else
+    log_warn "GPU_POWER_MODE='$GPU_POWER_MODE' is invalid — valid: off|percent|minus|fixed. Will skip power limiting."
+fi
 log_info "EXTRA_ARGS    : ${EXTRA_ARGS:-(none)}"
 log_info "SRB_VERSION   : $SRB_VERSION"
 log_debug "URL_DOWNLOAD  : $URL_DOWNLOAD"
 log_debug "EXPECTED_MD5  : ${EXPECTED_MD5:-(skip check)}"
 log_debug "INSTALL_DIR   : $INSTALL_DIR"
 log_debug "API_ENABLE=$API_ENABLE API_PORT=$API_PORT GPU_OFF_TEMP=${GPU_OFF_TEMP}°C NO_SHARE_RESTART=${NO_SHARE_RESTART}s"
+log_debug "GPU_POWER_MODE=$GPU_POWER_MODE GPU_POWER_PERCENT=$GPU_POWER_PERCENT GPU_POWER_MINUS_W=$GPU_POWER_MINUS_W GPU_POWER_LIMIT_W=${GPU_POWER_LIMIT_W:-unset} GPU_POWER_PERSISTENCE=$GPU_POWER_PERSISTENCE"
 log_debug "DEBUG=$DEBUG FORCE_REINSTALL=$FORCE_REINSTALL RESTART_DELAY=${RESTART_DELAY}s MAX_RETRIES=$MAX_RETRIES MIN_UPTIME=${MIN_UPTIME}s"
 
 if [ -z "$WALLET" ]; then
@@ -461,6 +617,10 @@ else
     done
     log_info "Pool list (primary → failover): $POOL_LIST"
 fi
+
+
+# Apply optional NVIDIA power cap after GPU discovery and before miner startup.
+apply_gpu_power_limit
 
 # ============================================================================
 #  STEP 5: INSTALL & VERIFY SRBMINER-MULTI
@@ -683,12 +843,12 @@ fi
 # ============================================================================
 #  STEP 7: MINING LOOP
 # ============================================================================
-log_step 7 "Start mining loop (SRBMiner-Multi v$SRB_VERSION, GPU stock)"
+log_step 7 "Start mining loop (SRBMiner-Multi v$SRB_VERSION)"
 
 EXTRA_ARR=()
 if [ -n "$EXTRA_ARGS" ]; then read -r -a EXTRA_ARR <<< "$EXTRA_ARGS" || true; fi
 
-# Mining command: GPU stock — NO OC flags (no --gpu-cclock/--gpu-plimit...)
+# Mining command: no OC flags here. Optional power cap is applied earlier via nvidia-smi.
 MINER_CMD=(
     "$BIN_PATH"
     --algorithm "$ALGO"
