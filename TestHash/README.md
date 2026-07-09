@@ -1,178 +1,119 @@
-# KiQuai Hashtopolis + Hashcat Bootstrap for Vast.ai
+# KiQuai Hashtopolis + Hashcat on Vast.ai
 
-Triển khai tự động **Hashtopolis Server + Hashcat** trên máy GPU thuê từ **Vast.ai** chỉ bằng một lệnh `run.sh`.
+## Mục tiêu
 
-Mục tiêu của project này là tạo một bootstrap script có thể chạy trực tiếp trong Vast.ai instance để:
+Triển khai Hashtopolis Server + Hashcat trên Vast.ai bằng một file `run.sh` duy nhất.
 
-* Cài các package hệ thống cần thiết.
-* Kiểm tra GPU bằng `nvidia-smi`.
-* Cài `hashcat` trong chính Vast.ai instance.
-* Cài và khởi động Docker daemon bên trong instance.
-* Dựng Hashtopolis stack bằng Docker Compose.
-* Tự động cấu hình URL public dựa trên biến môi trường của Vast.ai.
-* In ra URL truy cập giao diện Hashtopolis sau khi triển khai xong.
+Thiết kế triển khai:
 
-> Chỉ sử dụng hệ thống này cho password recovery, security audit hoặc kiểm thử bảo mật khi có quyền hợp pháp. Không sử dụng cho hành vi truy cập trái phép.
+- Hashcat chạy trực tiếp trong Vast.ai instance để dùng GPU qua NVIDIA runtime của template.
+- Hashtopolis chạy bằng Docker Compose thông qua rootless Docker daemon để giảm lỗi nested Docker như `failed to create NAT chain DOCKER`, `operation not permitted`, `unable to setup quota`, hoặc lỗi iptables/cgroup.
+- Chỉ expose một port public, mặc định là `8080`, qua Nginx reverse proxy.
+- Script fail-fast, tự dump log container khi lỗi, thay vì để container restart loop mà không biết nguyên nhân.
 
----
-
-## 1. Kiến trúc tổng quan
-
-Trên Vast.ai, instance mà bạn thuê thường đã chạy bên trong một Docker container do provider khởi tạo. Vì vậy project này không tạo thêm một “root container” nữa. Thay vào đó, chính Vast.ai instance được dùng làm lớp root.
-
-```text
-Vast.ai GPU instance
-├── NVIDIA GPU access
-├── nvidia-smi
-├── hashcat
-├── Docker daemon chạy bên trong instance
-│   ├── hashtopolis-db
-│   ├── hashtopolis-backend
-│   ├── hashtopolis-frontend
-│   └── hashtopolis-proxy
-└── Public access qua Vast.ai port mapping
-```
-
-Thiết kế này ít lớp hơn so với mô hình:
-
-```text
-Vast.ai instance
-└── root container
-    └── Docker-in-Docker
-        └── Hashtopolis containers
-```
-
-Lý do chọn thiết kế hiện tại:
-
-* Tránh Docker-in-Docker lồng quá nhiều tầng.
-* Giảm lỗi liên quan đến cgroup, mount, network và GPU runtime.
-* Hashcat chạy trực tiếp trong instance nên dễ kiểm tra GPU hơn.
-* Hashtopolis server stack vẫn được quản lý sạch bằng Docker Compose.
-* Phù hợp với mô hình port mapping của Vast.ai.
+> Chỉ dùng cho password recovery, internal security audit, lab hoặc workload hợp pháp mà bạn có quyền xử lý.
 
 ---
 
-## 2. Thành phần được triển khai
+## 1. Cấu hình Vast.ai khuyến nghị
 
-Script sẽ tạo Hashtopolis stack gồm:
-
-```text
-hashtopolis-db         MariaDB database
-hashtopolis-backend    Hashtopolis backend API
-hashtopolis-frontend   Hashtopolis frontend UI
-hashtopolis-proxy      Nginx reverse proxy
-```
-
-Port nội bộ mặc định:
-
-```text
-8080
-```
-
-Public URL sẽ được script tự tính theo môi trường Vast.ai:
-
-```text
-http://PUBLIC_IPADDR:VAST_TCP_PORT_8080
-```
-
-Nếu không phát hiện được biến `VAST_TCP_PORT_8080`, script sẽ fallback về:
-
-```text
-http://PUBLIC_IPADDR:8080
-```
-
----
-
-## 3. Yêu cầu trước khi chạy
-
-### 3.1. Yêu cầu Vast.ai instance
-
-Nên chọn instance có:
-
-* NVIDIA GPU.
-* CUDA image.
-* Dung lượng disk đủ lớn.
-* Internet access.
-* Docker options cho phép privileged mode.
-* Port `8080` được expose.
-
-Khuyến nghị image:
-
-```text
-nvidia/cuda:12.6.0-devel-ubuntu24.04
-```
-
-Hoặc image CUDA Ubuntu mới hơn nếu host Vast.ai hỗ trợ tốt.
-
-Ví dụ:
+Image:
 
 ```text
 nvidia/cuda:12.9.1-devel-ubuntu24.04
 ```
 
-### 3.2. Docker options trên Vast.ai
-
-Trong Vast.ai template hoặc launch configuration, thêm Docker options:
+Docker options:
 
 ```bash
 --privileged -p 8080:8080 -e OPEN_BUTTON_PORT=8080 --shm-size=8g
 ```
 
-Ý nghĩa:
+Giải thích:
 
-```text
---privileged
-  Cho phép chạy Docker daemon bên trong Vast.ai instance.
-
--p 8080:8080
-  Expose Hashtopolis proxy port từ instance.
-
--e OPEN_BUTTON_PORT=8080
-  Cho Vast.ai biết port nào nên được dùng cho nút Open.
-
---shm-size=8g
-  Tăng shared memory, hữu ích cho workload lớn.
-```
-
-Nếu không có `--privileged`, Docker daemon bên trong instance có thể không khởi động được.
+- `--privileged`: cần cho môi trường Vast.ai nested/containerized để rootless Docker và user namespace có khả năng hoạt động ổn định hơn.
+- `-p 8080:8080`: expose Hashtopolis UI/proxy.
+- `-e OPEN_BUTTON_PORT=8080`: để nút Open của Vast.ai trỏ đúng port.
+- `--shm-size=8g`: tăng shared memory cho workload lớn.
 
 ---
 
-## 4. Cấu trúc repo đề xuất
+## 2. One-liner triển khai
 
-```text
-KiQuai/
-└── TestDiD/
-    ├── run.sh
-    └── README.md
-```
-
-File chính:
-
-```text
-TestDiD/run.sh
-```
-
-URL raw GitHub dự kiến:
-
-```text
-https://raw.githubusercontent.com/kuronoFS/KiQuai/refs/heads/main/TestDiD/run.sh
-```
-
----
-
-## 5. Cách triển khai nhanh
-
-SSH vào Vast.ai instance hoặc dùng on-start script, chạy một dòng:
+Sau khi SSH vào Vast.ai instance, chạy:
 
 ```bash
-bash -lc "apt-get update && apt-get install -y curl ca-certificates && curl -fsSL https://raw.githubusercontent.com/kuronoFS/KiQuai/refs/heads/main/TestDiD/run.sh | bash"
+bash -lc "apt-get update && apt-get install -y curl ca-certificates && curl -fsSL https://raw.githubusercontent.com/kuronoFS/KiQuai/refs/heads/main/TestDiD/run.sh -o run.sh && chmod +x run.sh && ./run.sh"
 ```
 
-Sau khi chạy xong, script sẽ in ra thông tin dạng:
+Nếu bạn upload file `run.sh` thủ công vào máy, chạy:
+
+```bash
+chmod +x run.sh
+./run.sh
+```
+
+---
+
+## 3. Biến môi trường quan trọng
+
+### Port và URL
+
+```bash
+INTERNAL_PORT=8080
+PUBLIC_URL="http://PUBLIC_IP:EXTERNAL_PORT"
+```
+
+Nếu Vast.ai không tự cung cấp đúng `VAST_TCP_PORT_8080`, hãy override thủ công:
+
+```bash
+PUBLIC_URL="http://YOUR_PUBLIC_IP:YOUR_EXTERNAL_PORT" ./run.sh
+```
+
+### Reset sạch toàn bộ database và volume
+
+```bash
+WIPE_DATA=1 ./run.sh
+```
+
+### Không reset data, chỉ recreate container
+
+Mặc định script đã dùng:
+
+```bash
+FORCE_RECREATE=1
+```
+
+Có thể tắt bằng:
+
+```bash
+FORCE_RECREATE=0 ./run.sh
+```
+
+### Override image nếu upstream tag thay đổi
+
+```bash
+HASHTOPOLIS_BACKEND_IMAGE=hashtopolis/backend:latest \
+HASHTOPOLIS_FRONTEND_IMAGE=hashtopolis/frontend:latest \
+./run.sh
+```
+
+Mặc định script đang dùng:
 
 ```text
-============================================================
+hashtopolis/backend:v1.0.0-rc1
+hashtopolis/frontend:master
+mysql:9.7
+nginx:alpine
+```
+
+---
+
+## 4. Sau khi deploy xong
+
+Script sẽ in ra:
+
+```text
 Hashtopolis URL:
   http://PUBLIC_IP:EXTERNAL_PORT
 
@@ -180,640 +121,172 @@ Admin username:
   admin
 
 Admin password:
-  RANDOM_GENERATED_PASSWORD
+  RANDOM_PASSWORD
 
 Backend API v2:
   http://PUBLIC_IP:EXTERNAL_PORT/api/v2
 
 Legacy agent API:
   http://PUBLIC_IP:EXTERNAL_PORT/api/server.php
-
-Check GPU:
-  nvidia-smi
-  hashcat -I
-
-Check containers:
-  docker compose -f /opt/kiquai-hashtopolis/docker-compose.yml ps
-============================================================
 ```
 
-Truy cập giao diện Hashtopolis bằng URL được in ra.
-
-Ví dụ:
-
-```text
-http://65.130.162.74:33526
-```
-
-Không nên mặc định truy cập:
-
-```text
-http://65.130.162.74:8080
-```
-
-Vì trên Vast.ai, external port có thể khác internal port `8080`.
-
----
-
-## 6. Biến môi trường hỗ trợ
-
-Có thể tùy chỉnh triển khai bằng cách truyền biến môi trường trước lệnh `bash`.
-
-### 6.1. Biến hệ thống
-
-| Biến            |                  Mặc định | Ý nghĩa                             |
-| --------------- | ------------------------: | ----------------------------------- |
-| `APP_DIR`       | `/opt/kiquai-hashtopolis` | Thư mục chứa Compose stack và data  |
-| `INTERNAL_PORT` |                    `8080` | Port nội bộ của Hashtopolis proxy   |
-| `PUBLIC_URL`    |         Tự động phát hiện | URL public custom nếu muốn override |
-
-### 6.2. Biến database
-
-| Biến              |      Mặc định | Ý nghĩa                   |
-| ----------------- | ------------: | ------------------------- |
-| `MYSQL_ROOT_PASS` |        Random | Root password cho MariaDB |
-| `MYSQL_DATABASE`  | `hashtopolis` | Tên database              |
-| `MYSQL_USER`      | `hashtopolis` | User database             |
-| `MYSQL_PASSWORD`  |        Random | Password database         |
-
-### 6.3. Biến Hashtopolis
-
-| Biến                         | Mặc định | Ý nghĩa                 |
-| ---------------------------- | -------: | ----------------------- |
-| `HASHTOPOLIS_ADMIN_USER`     |  `admin` | Tài khoản admin ban đầu |
-| `HASHTOPOLIS_ADMIN_PASSWORD` |   Random | Password admin ban đầu  |
-
----
-
-## 7. Ví dụ chạy với password tự đặt
+Lưu lại password ngay. File `.env` nằm tại:
 
 ```bash
-HASHTOPOLIS_ADMIN_USER="admin" \
-HASHTOPOLIS_ADMIN_PASSWORD="ChangeMe_StrongPassword_123" \
-MYSQL_ROOT_PASS="ChangeMe_DBRoot_123" \
-MYSQL_PASSWORD="ChangeMe_DBUser_123" \
-bash -lc "apt-get update && apt-get install -y curl ca-certificates && curl -fsSL https://raw.githubusercontent.com/kuronoFS/KiQuai/refs/heads/main/TestDiD/run.sh | bash"
-```
-
-Không khuyến nghị commit password thật vào GitHub.
-
----
-
-## 8. Ví dụ chạy với URL public override
-
-Nếu Vast.ai port mapping không được phát hiện đúng, có thể tự đặt `PUBLIC_URL`:
-
-```bash
-PUBLIC_URL="http://YOUR_PUBLIC_IP:YOUR_EXTERNAL_PORT" \
-bash -lc "apt-get update && apt-get install -y curl ca-certificates && curl -fsSL https://raw.githubusercontent.com/kuronoFS/KiQuai/refs/heads/main/TestDiD/run.sh | bash"
-```
-
-Ví dụ:
-
-```bash
-PUBLIC_URL="http://65.130.162.74:33526" \
-bash -lc "apt-get update && apt-get install -y curl ca-certificates && curl -fsSL https://raw.githubusercontent.com/kuronoFS/KiQuai/refs/heads/main/TestDiD/run.sh | bash"
+/home/kiquai/kiquai-hashtopolis/.env
 ```
 
 ---
 
-## 9. Cách kiểm tra sau khi triển khai
+## 5. Kiểm tra trạng thái
 
-### 9.1. Kiểm tra GPU
-
-```bash
-nvidia-smi
-```
-
-Kiểm tra Hashcat thấy GPU:
+Nạp Docker socket rootless:
 
 ```bash
-hashcat -I
+source /etc/profile.d/kiquai-rootless-docker.sh
 ```
 
-Nếu `hashcat -I` không thấy GPU, cần kiểm tra:
+Xem container:
 
 ```bash
-nvidia-smi
-clinfo
-ls -lah /dev/nvidia*
+cd /home/kiquai/kiquai-hashtopolis
+docker compose ps -a
 ```
-
-### 9.2. Kiểm tra Docker daemon
-
-```bash
-docker version
-docker info
-```
-
-### 9.3. Kiểm tra container Hashtopolis
-
-```bash
-docker ps
-```
-
-Hoặc:
-
-```bash
-docker compose -f /opt/kiquai-hashtopolis/docker-compose.yml ps
-```
-
-Kết quả mong muốn:
-
-```text
-hashtopolis-db          running
-hashtopolis-backend     running
-hashtopolis-frontend    running
-hashtopolis-proxy       running
-```
-
-### 9.4. Kiểm tra HTTP local
-
-```bash
-curl -I http://127.0.0.1:8080
-```
-
-Kiểm tra backend API v2:
-
-```bash
-curl -I http://127.0.0.1:8080/api/v2
-```
-
-Kiểm tra legacy agent API:
-
-```bash
-curl -I http://127.0.0.1:8080/api/server.php
-```
-
----
-
-## 10. Cách lấy URL public trên Vast.ai
-
-Kiểm tra biến môi trường:
-
-```bash
-echo "$PUBLIC_IPADDR"
-echo "$VAST_TCP_PORT_8080"
-```
-
-In URL:
-
-```bash
-echo "http://${PUBLIC_IPADDR}:${VAST_TCP_PORT_8080}"
-```
-
-Nếu `VAST_TCP_PORT_8080` rỗng, xem trong Vast.ai UI:
-
-```text
-Instance → IP Port Info
-```
-
-Tìm dòng tương tự:
-
-```text
-PUBLIC_IP:EXTERNAL_PORT -> 8080/tcp
-```
-
-Sau đó truy cập:
-
-```text
-http://PUBLIC_IP:EXTERNAL_PORT
-```
-
----
-
-## 11. Log và troubleshooting
-
-### 11.1. Xem log tổng quan
-
-```bash
-docker ps
-```
-
-```bash
-docker logs hashtopolis-db
-docker logs hashtopolis-backend
-docker logs hashtopolis-frontend
-docker logs hashtopolis-proxy
-```
-
-### 11.2. Xem log Docker daemon bên trong Vast instance
-
-```bash
-cat /var/log/dockerd.log
-```
-
-### 11.3. Restart Hashtopolis stack
-
-```bash
-cd /opt/kiquai-hashtopolis
-docker compose down
-docker compose up -d
-```
-
-### 11.4. Pull image mới nhất và recreate
-
-```bash
-cd /opt/kiquai-hashtopolis
-docker compose pull
-docker compose up -d
-```
-
-### 11.5. Xóa toàn bộ stack nhưng giữ data
-
-```bash
-cd /opt/kiquai-hashtopolis
-docker compose down
-```
-
-### 11.6. Xóa toàn bộ stack và data
-
-Cẩn thận: lệnh này xóa database và dữ liệu Hashtopolis.
-
-```bash
-rm -rf /opt/kiquai-hashtopolis
-```
-
-Sau đó chạy lại one-liner.
-
----
-
-## 12. Lỗi thường gặp
-
-### Lỗi 1: Không vào được giao diện Hashtopolis
-
-Kiểm tra container proxy:
-
-```bash
-docker logs hashtopolis-proxy
-docker ps
-```
-
-Kiểm tra local port:
-
-```bash
-curl -I http://127.0.0.1:8080
-```
-
-Kiểm tra public port trên Vast.ai:
-
-```bash
-echo "$PUBLIC_IPADDR"
-echo "$VAST_TCP_PORT_8080"
-```
-
-Nếu local truy cập được nhưng public không truy cập được, lỗi thường nằm ở Vast.ai port mapping hoặc Docker options chưa có:
-
-```bash
--p 8080:8080 -e OPEN_BUTTON_PORT=8080
-```
-
----
-
-### Lỗi 2: Docker daemon không start
 
 Xem log:
 
 ```bash
-cat /var/log/dockerd.log
+cd /home/kiquai/kiquai-hashtopolis
+./kiquai-logs.sh
 ```
 
-Nguyên nhân thường gặp:
-
-* Vast.ai instance không chạy với `--privileged`.
-* Image không tương thích.
-* Thiếu kernel capability cần thiết cho Docker-in-Docker.
-* Storage driver `overlay2` không hoạt động trong môi trường hiện tại.
-
-Cách xử lý:
-
-1. Đảm bảo Docker options có:
+Hoặc log từng service:
 
 ```bash
---privileged
+docker compose logs --tail 200 hashtopolis-backend
+docker compose logs --tail 200 hashtopolis-frontend
+docker compose logs --tail 200 db
+docker compose logs --tail 200 hashtopolis-proxy
 ```
 
-2. Nếu vẫn lỗi, thử đổi image CUDA Ubuntu khác.
-
----
-
-### Lỗi 3: `nvidia-smi` không hoạt động
-
-Kiểm tra:
+Kiểm tra HTTP local:
 
 ```bash
-ls -lah /dev/nvidia*
+curl -I http://127.0.0.1:8080
+curl -I http://127.0.0.1:8080/api/v2
+curl -I http://127.0.0.1:8080/api/server.php
 ```
 
-```bash
-nvidia-smi
-```
-
-Nếu không có `/dev/nvidia*`, instance chưa được cấp GPU đúng cách hoặc image/template không được cấu hình GPU passthrough.
-
-Cách xử lý:
-
-* Chọn lại Vast.ai offer có GPU.
-* Dùng CUDA image chính thức.
-* Kiểm tra template có bật GPU access.
-* Kiểm tra provider có hỗ trợ Docker options cần thiết hay không.
-
----
-
-### Lỗi 4: `hashcat -I` không thấy GPU
-
-Kiểm tra:
+Kiểm tra GPU:
 
 ```bash
 nvidia-smi
 hashcat -I
-clinfo
-```
-
-Nếu `nvidia-smi` thấy GPU nhưng `hashcat -I` không thấy backend phù hợp, có thể thiếu OpenCL runtime hoặc package trong image không phù hợp.
-
-Thử cài lại package liên quan:
-
-```bash
-apt-get update
-apt-get install -y ocl-icd-libopencl1 clinfo hashcat
-```
-
-Sau đó kiểm tra lại:
-
-```bash
-hashcat -I
 ```
 
 ---
 
-### Lỗi 5: Backend không kết nối được database
+## 6. Troubleshooting nhanh
 
-Kiểm tra database:
+### Container cứ exit/restart
 
-```bash
-docker logs hashtopolis-db
-```
-
-Kiểm tra backend:
+Chạy:
 
 ```bash
-docker logs hashtopolis-backend
+source /etc/profile.d/kiquai-rootless-docker.sh
+cd /home/kiquai/kiquai-hashtopolis
+docker compose ps -a
+docker compose logs --tail 300
 ```
 
-Kiểm tra container status:
+Script mới cũng tự dump diagnostics nếu lỗi xảy ra trong quá trình deploy.
+
+### Port 8080 bị chiếm
+
+Nếu Vast.ai template/Jupyter chiếm port 8080, dùng port khác:
 
 ```bash
-docker compose -f /opt/kiquai-hashtopolis/docker-compose.yml ps
+INTERNAL_PORT=18080 PUBLIC_URL="http://PUBLIC_IP:EXTERNAL_PORT" ./run.sh
 ```
 
-Nếu database chưa healthy, backend có thể cần thêm thời gian để khởi động.
-
----
-
-### Lỗi 6: Frontend gọi sai backend URL
-
-Kiểm tra file `.env`:
+Vast.ai Docker options cũng phải đổi tương ứng:
 
 ```bash
-cat /opt/kiquai-hashtopolis/.env
+--privileged -p 18080:18080 -e OPEN_BUTTON_PORT=18080 --shm-size=8g
 ```
 
-Dòng quan trọng:
+### Rootless Docker không chạy được
 
-```text
-HASHTOPOLIS_BACKEND_URL=http://PUBLIC_IP:EXTERNAL_PORT/api/v2
-```
+Nếu gặp lỗi user namespace, phần lớn là provider/template đang chặn. Cách xử lý thực tế:
 
-Nếu URL sai, sửa lại:
+1. Bảo đảm Docker options có `--privileged`.
+2. Đổi sang Vast.ai offer/provider khác.
+3. Không dùng nested Docker, chuyển sang VM/bare-metal nếu cần ổn định production.
+
+### URL public sai
+
+Kiểm tra:
 
 ```bash
-nano /opt/kiquai-hashtopolis/.env
+echo "$PUBLIC_IPADDR"
+echo "$VAST_TCP_PORT_8080"
 ```
 
-Sau đó recreate frontend/backend:
+Nếu rỗng hoặc sai, dùng:
 
 ```bash
-cd /opt/kiquai-hashtopolis
-docker compose up -d --force-recreate
-```
-
----
-
-## 13. Bảo mật vận hành
-
-### 13.1. Không dùng password mặc định
-
-Script tự sinh password random nếu không truyền biến môi trường. Sau khi chạy xong, password admin sẽ được in ra terminal.
-
-Nên lưu password ngay sau khi deploy.
-
-### 13.2. Không public lâu dài nếu chưa có bảo vệ
-
-Hashtopolis không nên expose public Internet lâu dài nếu chưa có:
-
-* Password mạnh.
-* Firewall.
-* Reverse proxy có TLS.
-* IP allowlist nếu có thể.
-* Backup database.
-* Monitoring log.
-
-### 13.3. Không lưu secret trong GitHub
-
-Không commit:
-
-```text
-.env
-hash_db/
-hash_data/
-```
-
-Nên thêm `.gitignore`:
-
-```gitignore
-.env
-hash_db/
-hash_data/
-*.log
-```
-
-### 13.4. Cẩn trọng với `--privileged`
-
-Deployment này cần `--privileged` để chạy Docker daemon bên trong Vast.ai instance. Đây là quyền rất mạnh. Chỉ chạy script từ repo bạn kiểm soát.
-
-Không chạy script lạ bằng:
-
-```bash
-curl URL | bash
-```
-
-trừ khi bạn đã đọc và hiểu toàn bộ nội dung script.
-
----
-
-## 14. Gợi ý production hardening
-
-Nếu dùng lâu dài, nên bổ sung:
-
-* Pin image version thay vì dùng `latest`.
-* Pin GitHub script bằng commit SHA thay vì branch `main`.
-* Bật HTTPS bằng Caddy, Traefik hoặc Nginx + cert.
-* Giới hạn IP truy cập Hashtopolis.
-* Tách database volume ra persistent disk nếu Vast.ai offer hỗ trợ.
-* Log rotation cho Docker.
-* Backup định kỳ thư mục `/opt/kiquai-hashtopolis`.
-* Không chạy workload không tin cậy trong cùng instance.
-
-Ví dụ pin script bằng commit SHA:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/kuronoFS/KiQuai/<COMMIT_SHA>/TestDiD/run.sh | bash
+PUBLIC_URL="http://PUBLIC_IP:EXTERNAL_PORT" ./run.sh
 ```
 
 ---
 
-## 15. Các lệnh quản trị nhanh
+## 7. Quản trị thường dùng
 
-### Xem tất cả container
-
-```bash
-docker ps -a
-```
-
-### Vào container backend
+Restart stack:
 
 ```bash
-docker exec -it hashtopolis-backend sh
-```
-
-### Vào container database
-
-```bash
-docker exec -it hashtopolis-db bash
-```
-
-### Restart proxy
-
-```bash
-docker restart hashtopolis-proxy
-```
-
-### Restart toàn bộ stack
-
-```bash
-cd /opt/kiquai-hashtopolis
+source /etc/profile.d/kiquai-rootless-docker.sh
+cd /home/kiquai/kiquai-hashtopolis
 docker compose restart
 ```
 
-### Stop toàn bộ stack
+Stop stack:
 
 ```bash
-cd /opt/kiquai-hashtopolis
+source /etc/profile.d/kiquai-rootless-docker.sh
+cd /home/kiquai/kiquai-hashtopolis
 docker compose down
 ```
 
-### Start lại stack
+Start lại:
 
 ```bash
-cd /opt/kiquai-hashtopolis
+source /etc/profile.d/kiquai-rootless-docker.sh
+cd /home/kiquai/kiquai-hashtopolis
 docker compose up -d
 ```
 
----
-
-## 16. Kiểm tra file được tạo bởi script
-
-Sau khi chạy thành công:
+Xóa sạch và deploy lại:
 
 ```bash
-ls -lah /opt/kiquai-hashtopolis
-```
-
-Kỳ vọng có:
-
-```text
-.env
-docker-compose.yml
-nginx.conf
-hash_db/
-hash_data/
-```
-
-Xem Compose file:
-
-```bash
-cat /opt/kiquai-hashtopolis/docker-compose.yml
-```
-
-Xem Nginx config:
-
-```bash
-cat /opt/kiquai-hashtopolis/nginx.conf
+WIPE_DATA=1 ./run.sh
 ```
 
 ---
 
-## 17. Luồng triển khai chuẩn
+## 8. Agent Hashtopolis
 
-Quy trình khuyến nghị:
-
-```text
-1. Tạo Vast.ai instance bằng CUDA Ubuntu image.
-2. Thêm Docker options:
-   --privileged -p 8080:8080 -e OPEN_BUTTON_PORT=8080 --shm-size=8g
-
-3. Chạy one-liner:
-   curl raw run.sh | bash
-
-4. Đọc URL và admin password do script in ra.
-
-5. Mở Hashtopolis UI bằng:
-   http://PUBLIC_IP:EXTERNAL_PORT
-
-6. Kiểm tra GPU:
-   nvidia-smi
-   hashcat -I
-
-7. Kiểm tra stack:
-   docker ps
-```
-
----
-
-## 18. Ghi chú về Hashtopolis Agent
-
-Script này dựng Hashtopolis server và cài Hashcat trong Vast.ai instance.
-
-Để dùng Hashtopolis đúng mô hình distributed cracking, bạn cần đăng ký Hashtopolis Agent trỏ về API server của Hashtopolis.
-
-Legacy agent API thường có dạng:
+Server đã expose legacy agent API tại:
 
 ```text
 http://PUBLIC_IP:EXTERNAL_PORT/api/server.php
 ```
 
-Luồng cơ bản:
+Luồng dùng agent:
 
-```text
-1. Vào Hashtopolis UI.
-2. Tạo agent voucher.
-3. Tải hoặc cấu hình Hashtopolis Python Agent.
-4. Chạy agent trên cùng Vast.ai instance.
-5. Agent gọi hashcat để xử lý task.
-```
+1. Mở Hashtopolis UI.
+2. Tạo voucher agent.
+3. Chạy Hashtopolis Python Agent trực tiếp trên Vast.ai instance.
+4. Agent gọi `hashcat` trực tiếp trên máy, nơi GPU đã được expose.
 
-Khuyến nghị: để agent chạy trực tiếp trong Vast.ai instance, cùng nơi có `hashcat` và GPU. Không nên chạy agent trong container backend/frontend, vì backend/frontend chỉ là server web/API.
-
----
-
-## 19. Disclaimer
-
-Project này chỉ cung cấp automation triển khai môi trường Hashtopolis + Hashcat cho mục đích hợp pháp như:
-
-* Password recovery cho hệ thống của chính bạn.
-* Internal security audit.
-* Lab nghiên cứu bảo mật.
-* Benchmark GPU được phép.
-
-Không sử dụng để tấn công, truy cập trái phép hoặc xử lý dữ liệu không thuộc quyền kiểm soát của bạn.
+Không nên chạy cracking agent bên trong container backend/frontend. Backend/frontend chỉ là server/API/UI.
