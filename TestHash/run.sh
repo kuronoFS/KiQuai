@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-APP_DIR="${APP_DIR:-/opt/kiquai-hashtopolis}"
+# Vast.ai-friendly Hashtopolis + Hashcat bootstrap.
+# Key design: run Hashcat directly in the Vast instance, and run Hashtopolis
+# server containers using ROOTLESS Docker to avoid CAP_NET_ADMIN/iptables errors.
+
+DOCKER_USER="${DOCKER_USER:-kiquai}"
 INTERNAL_PORT="${INTERNAL_PORT:-8080}"
+APP_DIR="${APP_DIR:-/home/${DOCKER_USER}/kiquai-hashtopolis}"
 
-MYSQL_ROOT_PASS="${MYSQL_ROOT_PASS:-$(openssl rand -base64 24 | tr -d '=+/ ' | cut -c1-24)}"
-MYSQL_DATABASE="${MYSQL_DATABASE:-hashtopolis}"
-MYSQL_USER="${MYSQL_USER:-hashtopolis}"
-MYSQL_PASSWORD="${MYSQL_PASSWORD:-$(openssl rand -base64 24 | tr -d '=+/ ' | cut -c1-24)}"
-
-HASHTOPOLIS_ADMIN_USER="${HASHTOPOLIS_ADMIN_USER:-admin}"
-HASHTOPOLIS_ADMIN_PASSWORD="${HASHTOPOLIS_ADMIN_PASSWORD:-$(openssl rand -base64 24 | tr -d '=+/ ' | cut -c1-24)}"
+MYSQL_DATABASE_DEFAULT="${MYSQL_DATABASE:-hashtopolis}"
+MYSQL_USER_DEFAULT="${MYSQL_USER:-hashtopolis}"
+HASHTOPOLIS_ADMIN_USER_DEFAULT="${HASHTOPOLIS_ADMIN_USER:-admin}"
 
 PUBLIC_URL_OVERRIDE="${PUBLIC_URL:-}"
 PUBLIC_IP="${PUBLIC_IPADDR:-$(curl -fsS https://api.ipify.org || echo 127.0.0.1)}"
@@ -19,23 +20,47 @@ PUBLIC_PORT_DETECTED="${!PUBLIC_PORT_VAR:-}"
 PUBLIC_PORT="${PUBLIC_PORT_DETECTED:-${INTERNAL_PORT}}"
 PUBLIC_URL="${PUBLIC_URL:-http://${PUBLIC_IP}:${PUBLIC_PORT}}"
 
-if [ -z "${PUBLIC_PORT_DETECTED}" ] && [ -z "${PUBLIC_URL_OVERRIDE}" ]; then
-  echo "WARNING: ${PUBLIC_PORT_VAR} is not set in this environment." >&2
-  echo "         Falling back to internal port ${INTERNAL_PORT}, which is usually WRONG for" >&2
-  echo "         external access on Vast.ai (external port is mapped randomly)." >&2
-  echo "         Find the real port in the Vast.ai 'IP Port Info' popup (PUBLIC_IP:EXTERNAL_PORT -> ${INTERNAL_PORT}/tcp)" >&2
-  echo "         and re-run with PUBLIC_URL=\"http://PUBLIC_IP:EXTERNAL_PORT\" to fix the printed URL." >&2
-fi
+log() { echo "[$(date +'%F %T')] $*"; }
+fatal() { echo "ERROR: $*" >&2; exit 1; }
 
-echo "[1/9] Validating GPU..."
-nvidia-smi || {
-  echo "ERROR: nvidia-smi failed. Make sure the Vast.ai instance has GPU access."
-  exit 1
+require_root() {
+  if [ "$(id -u)" -ne 0 ]; then
+    fatal "Run this script as root inside the Vast.ai instance."
+  fi
 }
 
-echo "[2/9] Installing system packages..."
-export DEBIAN_FRONTEND=noninteractive
+rand_secret() {
+  openssl rand -base64 32 | tr -d '=+/ ' | cut -c1-32
+}
 
+upsert_env() {
+  local key="$1"
+  local value="$2"
+  local file="$3"
+  if grep -q "^${key}=" "$file" 2>/dev/null; then
+    sed -i "s|^${key}=.*|${key}=${value}|" "$file"
+  else
+    echo "${key}=${value}" >> "$file"
+  fi
+}
+
+require_root
+
+if [ -z "${PUBLIC_PORT_DETECTED}" ] && [ -z "${PUBLIC_URL_OVERRIDE}" ]; then
+  echo "WARNING: ${PUBLIC_PORT_VAR} is not set." >&2
+  echo "         Vast.ai usually maps internal ports to random external ports." >&2
+  echo "         If the printed URL is wrong, find the mapping in Vast.ai IP Port Info" >&2
+  echo "         and rerun with PUBLIC_URL=\"http://PUBLIC_IP:EXTERNAL_PORT\"." >&2
+fi
+
+log "[1/10] Validating GPU"
+if ! command -v nvidia-smi >/dev/null 2>&1; then
+  fatal "nvidia-smi is not installed in this image. Use a CUDA/NVIDIA Vast.ai image."
+fi
+nvidia-smi || fatal "nvidia-smi failed. The Vast.ai instance does not expose GPU correctly."
+
+log "[2/10] Installing system packages"
+export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y --no-install-recommends \
   ca-certificates \
@@ -48,11 +73,13 @@ apt-get install -y --no-install-recommends \
   procps \
   iproute2 \
   uidmap \
+  dbus-user-session \
+  fuse-overlayfs \
+  slirp4netns \
   bash \
   git \
   jq \
   openssl \
-  fuse-overlayfs \
   python3 \
   python3-pip \
   python3-venv \
@@ -64,17 +91,13 @@ apt-get install -y --no-install-recommends \
   ocl-icd-libopencl1 \
   hashcat
 
-echo "[3/9] Installing Docker Engine inside Vast instance..."
-if ! command -v docker >/dev/null 2>&1; then
+log "[3/10] Installing Docker Engine + rootless extras"
+if ! command -v docker >/dev/null 2>&1 || ! command -v dockerd-rootless.sh >/dev/null 2>&1; then
   install -m 0755 -d /etc/apt/keyrings
-
-  curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
-    -o /etc/apt/keyrings/docker.asc
-
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
   chmod a+r /etc/apt/keyrings/docker.asc
 
   . /etc/os-release
-
   echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu ${VERSION_CODENAME} stable" \
     > /etc/apt/sources.list.d/docker.list
 
@@ -82,99 +105,141 @@ if ! command -v docker >/dev/null 2>&1; then
   apt-get install -y --no-install-recommends \
     docker-ce \
     docker-ce-cli \
+    docker-ce-rootless-extras \
     containerd.io \
     docker-buildx-plugin \
     docker-compose-plugin
 fi
 
-echo "[4/9] Starting dockerd..."
-mkdir -p /var/run /var/lib/docker /etc/docker
-
-# A Vast.ai instance already runs inside an overlayfs-backed container, so
-# overlay2 (overlay-on-overlay) is not supported for the nested daemon. Also
-# disable the containerd snapshotter, which does not auto-fall back. Try a
-# nested-friendly storage driver (fuse-overlayfs first, then vfs).
-modprobe fuse 2>/dev/null || true
-[ -e /dev/fuse ] || mknod /dev/fuse c 10 229 2>/dev/null || true
-
-write_daemon_json() {
-  cat > /etc/docker/daemon.json <<EOF
-{
-  "features": { "containerd-snapshotter": false },
-  "storage-driver": "$1"
-}
-EOF
-}
-
-start_dockerd() {
-  pkill dockerd 2>/dev/null || true
-  sleep 2
-  dockerd --host=unix:///var/run/docker.sock > /var/log/dockerd.log 2>&1 &
-  for _ in $(seq 1 60); do
-    if docker info >/dev/null 2>&1; then
-      return 0
-    fi
-    if ! pgrep dockerd >/dev/null 2>&1; then
-      return 1
-    fi
-    sleep 1
-  done
-  return 1
-}
-
-if pgrep dockerd >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-  echo "  -> dockerd already running"
-else
-  DOCKER_OK=0
-  for drv in fuse-overlayfs vfs; do
-    echo "  -> trying storage-driver=${drv}"
-    write_daemon_json "${drv}"
-    if start_dockerd; then
-      echo "  -> dockerd started with storage-driver=${drv}"
-      DOCKER_OK=1
-      break
-    fi
-    echo "  -> storage-driver=${drv} failed, see /var/log/dockerd.log"
-  done
-
-  if [ "${DOCKER_OK}" -ne 1 ]; then
-    echo "ERROR: dockerd failed to start with all storage drivers."
-    cat /var/log/dockerd.log || true
-    exit 1
-  fi
+log "[4/10] Preparing rootless Docker user"
+if ! id "${DOCKER_USER}" >/dev/null 2>&1; then
+  useradd -m -s /bin/bash "${DOCKER_USER}"
 fi
 
-echo "[5/9] Checking hashcat..."
+DOCKER_UID="$(id -u "${DOCKER_USER}")"
+DOCKER_GID="$(id -g "${DOCKER_USER}")"
+DOCKER_HOME="$(getent passwd "${DOCKER_USER}" | cut -d: -f6)"
+XDG_RUNTIME_DIR="/run/user/${DOCKER_UID}"
+ROOTLESS_DOCKER_SOCK="${XDG_RUNTIME_DIR}/docker.sock"
+export DOCKER_HOST="unix://${ROOTLESS_DOCKER_SOCK}"
+
+mkdir -p "${XDG_RUNTIME_DIR}"
+chown "${DOCKER_UID}:${DOCKER_GID}" "${XDG_RUNTIME_DIR}"
+chmod 700 "${XDG_RUNTIME_DIR}"
+
+# Rootless Docker requires subordinate UID/GID ranges.
+if ! grep -q "^${DOCKER_USER}:" /etc/subuid 2>/dev/null; then
+  echo "${DOCKER_USER}:100000:65536" >> /etc/subuid
+fi
+if ! grep -q "^${DOCKER_USER}:" /etc/subgid 2>/dev/null; then
+  echo "${DOCKER_USER}:100000:65536" >> /etc/subgid
+fi
+
+# Hard fail early when the provider/template blocks unprivileged user namespaces.
+if ! su -s /bin/bash "${DOCKER_USER}" -c "XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR} unshare -Ur true" >/dev/null 2>&1; then
+  cat >&2 <<EOM
+ERROR: unprivileged user namespaces are not available in this Vast.ai instance.
+Rootless Docker cannot run here.
+
+Fix options:
+  1. Use a different Vast.ai offer/template that allows rootless containers/user namespaces.
+  2. Use a provider/template that truly supports privileged Docker-in-Docker.
+  3. Avoid nested Docker and deploy Hashtopolis on a native VM/bare-metal host.
+EOM
+  exit 1
+fi
+
+log "[5/10] Starting rootless dockerd"
+mkdir -p "${DOCKER_HOME}/.local/share/docker" "${DOCKER_HOME}/.config/docker"
+chown -R "${DOCKER_UID}:${DOCKER_GID}" "${DOCKER_HOME}/.local" "${DOCKER_HOME}/.config"
+
+# Stop stale rootless daemons owned by the Docker user only.
+pkill -u "${DOCKER_UID}" rootlesskit 2>/dev/null || true
+pkill -u "${DOCKER_UID}" dockerd 2>/dev/null || true
+rm -f "${ROOTLESS_DOCKER_SOCK}"
+
+su -s /bin/bash "${DOCKER_USER}" -c "
+  export XDG_RUNTIME_DIR='${XDG_RUNTIME_DIR}'
+  export PATH='/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin'
+  nohup dockerd-rootless.sh \
+    --host='unix://${ROOTLESS_DOCKER_SOCK}' \
+    --storage-driver=fuse-overlayfs \
+    --iptables=false \
+    > '${DOCKER_HOME}/dockerd-rootless.log' 2>&1 &
+"
+
+for _ in $(seq 1 90); do
+  if docker info >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+done
+
+if ! docker info >/dev/null 2>&1; then
+  echo "ERROR: rootless dockerd failed to start." >&2
+  echo "==== ${DOCKER_HOME}/dockerd-rootless.log ====" >&2
+  cat "${DOCKER_HOME}/dockerd-rootless.log" >&2 || true
+  exit 1
+fi
+
+cat > /etc/profile.d/kiquai-rootless-docker.sh <<EOF2
+export DOCKER_HOST=unix://${ROOTLESS_DOCKER_SOCK}
+EOF2
+
+log "Rootless Docker is ready"
+docker info --format 'Docker driver={{.Driver}} rootless={{.SecurityOptions}}'
+
+log "[6/10] Checking hashcat"
 hashcat --version || true
 hashcat -I || true
 
-echo "[6/9] Creating Hashtopolis stack..."
+log "[7/10] Preparing Hashtopolis app directory"
 mkdir -p "${APP_DIR}"
+chown -R "${DOCKER_UID}:${DOCKER_GID}" "${APP_DIR}"
 cd "${APP_DIR}"
 
-cat > .env <<EOF
+if [ -f .env ]; then
+  log "Existing .env found; preserving database/admin secrets"
+  set -a
+  # shellcheck disable=SC1091
+  . ./.env
+  set +a
+fi
+
+MYSQL_ROOT_PASS="${MYSQL_ROOT_PASS:-$(rand_secret)}"
+MYSQL_DATABASE="${MYSQL_DATABASE:-${MYSQL_DATABASE_DEFAULT}}"
+MYSQL_USER="${MYSQL_USER:-${MYSQL_USER_DEFAULT}}"
+MYSQL_PASSWORD="${MYSQL_PASSWORD:-$(rand_secret)}"
+HASHTOPOLIS_ADMIN_USER="${HASHTOPOLIS_ADMIN_USER:-${HASHTOPOLIS_ADMIN_USER_DEFAULT}}"
+HASHTOPOLIS_ADMIN_PASSWORD="${HASHTOPOLIS_ADMIN_PASSWORD:-$(rand_secret)}"
+HASHTOPOLIS_BACKEND_URL="${PUBLIC_URL}/api/v2"
+
+cat > .env <<EOF2
+INTERNAL_PORT=${INTERNAL_PORT}
 MYSQL_ROOT_PASS=${MYSQL_ROOT_PASS}
 MYSQL_DATABASE=${MYSQL_DATABASE}
 MYSQL_USER=${MYSQL_USER}
 MYSQL_PASSWORD=${MYSQL_PASSWORD}
 HASHTOPOLIS_ADMIN_USER=${HASHTOPOLIS_ADMIN_USER}
 HASHTOPOLIS_ADMIN_PASSWORD=${HASHTOPOLIS_ADMIN_PASSWORD}
-HASHTOPOLIS_BACKEND_URL=${PUBLIC_URL}/api/v2
-EOF
+HASHTOPOLIS_BACKEND_URL=${HASHTOPOLIS_BACKEND_URL}
+EOF2
+chown "${DOCKER_UID}:${DOCKER_GID}" .env
+chmod 600 .env
 
-cat > docker-compose.yml <<'EOF'
+cat > docker-compose.yml <<'EOF2'
 services:
   hashtopolis-db:
     image: mariadb:10.11
     container_name: hashtopolis-db
-    restart: always
+    restart: unless-stopped
     environment:
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASS}
       MYSQL_DATABASE: ${MYSQL_DATABASE}
       MYSQL_USER: ${MYSQL_USER}
       MYSQL_PASSWORD: ${MYSQL_PASSWORD}
     volumes:
-      - ./hash_db:/var/lib/mysql
+      - hash_db:/var/lib/mysql
     healthcheck:
       test: ["CMD-SHELL", "mariadb-admin ping -h 127.0.0.1 -uroot -p$${MYSQL_ROOT_PASSWORD} || exit 1"]
       interval: 10s
@@ -184,7 +249,7 @@ services:
   hashtopolis-backend:
     image: hashtopolis/backend:latest
     container_name: hashtopolis-backend
-    restart: always
+    restart: unless-stopped
     environment:
       HASHTOPOLIS_DB_TYPE: mysql
       HASHTOPOLIS_DB_HOST: hashtopolis-db
@@ -197,7 +262,7 @@ services:
       HASHTOPOLIS_FRONTEND_PORT: 80
       HASHTOPOLIS_APIV2_ENABLE: "1"
     volumes:
-      - ./hash_data:/usr/local/share/hashtopolis:Z
+      - hash_data:/usr/local/share/hashtopolis
     depends_on:
       hashtopolis-db:
         condition: service_healthy
@@ -205,7 +270,7 @@ services:
   hashtopolis-frontend:
     image: hashtopolis/frontend:latest
     container_name: hashtopolis-frontend
-    restart: always
+    restart: unless-stopped
     environment:
       HASHTOPOLIS_BACKEND_URL: ${HASHTOPOLIS_BACKEND_URL}
     depends_on:
@@ -214,17 +279,21 @@ services:
   hashtopolis-proxy:
     image: nginx:alpine
     container_name: hashtopolis-proxy
-    restart: always
+    restart: unless-stopped
     ports:
-      - "8080:80"
+      - "${INTERNAL_PORT}:80"
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
     depends_on:
       - hashtopolis-frontend
       - hashtopolis-backend
-EOF
 
-cat > nginx.conf <<'EOF'
+volumes:
+  hash_db:
+  hash_data:
+EOF2
+
+cat > nginx.conf <<'EOF2'
 events {}
 
 http {
@@ -274,53 +343,60 @@ http {
     }
   }
 }
-EOF
+EOF2
+chown "${DOCKER_UID}:${DOCKER_GID}" docker-compose.yml nginx.conf
 
-echo "[7/9] Pulling and starting Hashtopolis containers..."
-
-# On Vast.ai the internal port 8080 is also the default Jupyter port. If something
-# is already listening on it, the proxy's "8080:80" publish will fail to bind.
+log "[8/10] Checking internal port ${INTERNAL_PORT}"
 if command -v ss >/dev/null 2>&1 && ss -ltnH "sport = :${INTERNAL_PORT}" 2>/dev/null | grep -q .; then
-  echo "WARNING: something is already listening on port ${INTERNAL_PORT} inside this instance" >&2
-  echo "         (often Jupyter). The hashtopolis-proxy publish '${INTERNAL_PORT}:80' may fail to bind." >&2
-  echo "         Free port ${INTERNAL_PORT} first (e.g. launch the Vast.ai instance in SSH mode instead of Jupyter)." >&2
+  echo "ERROR: port ${INTERNAL_PORT} is already listening inside this Vast.ai instance." >&2
+  echo "       Common cause: Jupyter launch mode already uses 8080." >&2
+  echo "       Fix: launch in SSH mode, or set INTERNAL_PORT=18080 and expose -p 18080:18080 in Vast.ai." >&2
+  ss -ltnp "sport = :${INTERNAL_PORT}" || true
+  exit 1
 fi
 
+log "[9/10] Pulling and starting Hashtopolis containers"
 docker compose pull
 docker compose up -d
 
-echo "[8/9] Status..."
+log "[10/10] Status"
 docker compose ps
 
-echo "[9/9] Done."
-echo
-echo "============================================================"
-echo "Hashtopolis URL:"
-echo "  ${PUBLIC_URL}"
-echo
-echo "Admin username:"
-echo "  ${HASHTOPOLIS_ADMIN_USER}"
-echo
-echo "Admin password:"
-echo "  ${HASHTOPOLIS_ADMIN_PASSWORD}"
-echo
-echo "Backend API v2:"
-echo "  ${PUBLIC_URL}/api/v2"
-echo
-echo "Legacy agent API:"
-echo "  ${PUBLIC_URL}/api/server.php"
-echo
-echo "Check GPU:"
-echo "  nvidia-smi"
-echo "  hashcat -I"
-echo
-echo "Check containers:"
-echo "  docker compose -f ${APP_DIR}/docker-compose.yml ps"
-echo
-echo "Check Docker storage driver (should be fuse-overlayfs or vfs, NOT overlay2):"
-echo "  docker info --format '{{.Driver}}'"
-echo
-echo "Check HTTP locally:"
-echo "  curl -I http://127.0.0.1:${INTERNAL_PORT}"
-echo "  curl -I http://127.0.0.1:${INTERNAL_PORT}/api/v2"
-echo "============================================================"
+cat <<EOF2
+
+============================================================
+Hashtopolis URL:
+  ${PUBLIC_URL}
+
+Admin username:
+  ${HASHTOPOLIS_ADMIN_USER}
+
+Admin password:
+  ${HASHTOPOLIS_ADMIN_PASSWORD}
+
+Backend API v2:
+  ${PUBLIC_URL}/api/v2
+
+Legacy agent API:
+  ${PUBLIC_URL}/api/server.php
+
+Rootless Docker socket:
+  ${DOCKER_HOST}
+
+Check GPU:
+  nvidia-smi
+  hashcat -I
+
+Check containers:
+  export DOCKER_HOST=${DOCKER_HOST}
+  docker compose -f ${APP_DIR}/docker-compose.yml ps
+
+Check Docker mode:
+  docker info --format '{{json .SecurityOptions}}'
+  docker info --format '{{.Driver}}'
+
+Check HTTP locally:
+  curl -I http://127.0.0.1:${INTERNAL_PORT}
+  curl -I http://127.0.0.1:${INTERNAL_PORT}/api/v2
+============================================================
+EOF2
