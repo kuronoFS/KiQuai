@@ -2,78 +2,82 @@
 set -Eeuo pipefail
 
 # KiQuai Hashtopolis + Hashcat bootstrap for Vast.ai
-# Target image: nvidia/cuda:12.9.1-devel-ubuntu24.04
-# Target Vast Docker options: --privileged -p 8080:8080 -e OPEN_BUTTON_PORT=8080 --shm-size=8g
+# Mode: ROOTFUL Docker-in-Docker safe mode.
+# Use this when rootless Docker fails with:
+#   "unprivileged user namespaces are not available"
 #
 # Design goals:
-#   - Run Hashcat directly in the Vast.ai instance for GPU access.
-#   - Run Hashtopolis server containers through rootless Docker to avoid
-#     CAP_NET_ADMIN / iptables / NAT-chain failures in nested container setups.
-#   - Use one public port through Nginx reverse proxy.
-#   - Fail loudly with diagnostics instead of hiding container crash loops.
-#
-# Security/legal notice:
-#   Use only for authorized password recovery, internal security audit, or lab work.
+# - Do NOT require rootless Docker/user namespaces.
+# - Avoid Docker iptables/NAT manipulation by not publishing container ports.
+# - Expose Hashtopolis through a host-level socat TCP proxy to a static proxy-container IP.
+# - Fail fast and dump actionable logs instead of silent restart loops.
+# - Keep Hashcat installed directly in the Vast.ai instance, not inside Hashtopolis containers.
 
-#######################################
-# User-configurable variables
-#######################################
-DOCKER_USER="${DOCKER_USER:-kiquai}"
-INTERNAL_PORT="${INTERNAL_PORT:-${OPEN_BUTTON_PORT:-8080}}"
-APP_DIR="${APP_DIR:-/home/${DOCKER_USER}/kiquai-hashtopolis}"
-COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-kiquai_hashtopolis}"
+############################
+# User-configurable values #
+############################
 
-# Hashtopolis image defaults.
-# These can be overridden at runtime if upstream tags change:
-#   HASHTOPOLIS_BACKEND_IMAGE=hashtopolis/backend:latest HASHTOPOLIS_FRONTEND_IMAGE=hashtopolis/frontend:master bash run.sh
-HASHTOPOLIS_BACKEND_IMAGE="${HASHTOPOLIS_BACKEND_IMAGE:-hashtopolis/backend:v1.0.0-rc1}"
-HASHTOPOLIS_FRONTEND_IMAGE="${HASHTOPOLIS_FRONTEND_IMAGE:-hashtopolis/frontend:master}"
-DB_IMAGE="${DB_IMAGE:-mysql:9.7}"
-NGINX_IMAGE="${NGINX_IMAGE:-nginx:alpine}"
+APP_DIR="${APP_DIR:-/opt/kiquai-hashtopolis}"
+INTERNAL_PORT="${INTERNAL_PORT:-8080}"
+OPEN_BUTTON_PORT="${OPEN_BUTTON_PORT:-${INTERNAL_PORT}}"
 
-MYSQL_DATABASE_DEFAULT="${MYSQL_DATABASE:-hashtopolis}"
-MYSQL_USER_DEFAULT="${MYSQL_USER:-hashtopolis}"
-HASHTOPOLIS_ADMIN_USER_DEFAULT="${HASHTOPOLIS_ADMIN_USER:-admin}"
-
-STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-420}"
-HTTP_TIMEOUT="${HTTP_TIMEOUT:-5}"
-RESTART_ROOTLESS_DOCKER="${RESTART_ROOTLESS_DOCKER:-auto}"
-FORCE_RECREATE="${FORCE_RECREATE:-1}"
-WIPE_DATA="${WIPE_DATA:-0}"
-SKIP_GPU_CHECK="${SKIP_GPU_CHECK:-0}"
-SKIP_HASHCAT_CHECK="${SKIP_HASHCAT_CHECK:-0}"
-DEBUG="${DEBUG:-0}"
-
+# Public URL detection for Vast.ai.
 PUBLIC_URL_OVERRIDE="${PUBLIC_URL:-}"
-PUBLIC_IP="${PUBLIC_IPADDR:-$(curl -fsS --connect-timeout 4 https://api.ipify.org 2>/dev/null || echo 127.0.0.1)}"
+PUBLIC_IP="${PUBLIC_IPADDR:-$(curl -fsS --max-time 10 https://api.ipify.org 2>/dev/null || echo 127.0.0.1)}"
 PUBLIC_PORT_VAR="VAST_TCP_PORT_${INTERNAL_PORT}"
 PUBLIC_PORT_DETECTED="${!PUBLIC_PORT_VAR:-}"
 PUBLIC_PORT="${PUBLIC_PORT_DETECTED:-${INTERNAL_PORT}}"
 PUBLIC_URL="${PUBLIC_URL:-http://${PUBLIC_IP}:${PUBLIC_PORT}}"
-HASHTOPOLIS_BACKEND_URL="${HASHTOPOLIS_BACKEND_URL:-${PUBLIC_URL}/api/v2}"
-HASHTOPOLIS_FRONTEND_PORT="${HASHTOPOLIS_FRONTEND_PORT:-${PUBLIC_PORT}}"
 
-#######################################
-# Generic helpers
-#######################################
+# Images. Override if upstream tags change.
+HASHTOPOLIS_BACKEND_IMAGE="${HASHTOPOLIS_BACKEND_IMAGE:-hashtopolis/backend:v1.0.0-rc1}"
+HASHTOPOLIS_FRONTEND_IMAGE="${HASHTOPOLIS_FRONTEND_IMAGE:-hashtopolis/frontend:master}"
+DB_IMAGE="${DB_IMAGE:-mysql:8.4}"
+NGINX_IMAGE="${NGINX_IMAGE:-nginx:1.27-alpine}"
+
+# Database / admin defaults.
+MYSQL_DATABASE_DEFAULT="${MYSQL_DATABASE:-hashtopolis}"
+MYSQL_USER_DEFAULT="${MYSQL_USER:-hashtopolis}"
+HASHTOPOLIS_ADMIN_USER_DEFAULT="${HASHTOPOLIS_ADMIN_USER:-admin}"
+
+# Docker-in-Docker daemon paths.
+DOCKER_SOCK="${DOCKER_SOCK:-/var/run/kiquai-docker.sock}"
+DOCKER_PID="${DOCKER_PID:-/var/run/kiquai-dockerd.pid}"
+DOCKER_DATA_ROOT="${DOCKER_DATA_ROOT:-/var/lib/kiquai-docker}"
+DOCKER_EXEC_ROOT="${DOCKER_EXEC_ROOT:-/var/run/kiquai-docker}"
+DOCKER_LOG="${DOCKER_LOG:-/var/log/kiquai-dockerd.log}"
+CONTAINERD_LOG="${CONTAINERD_LOG:-/var/log/kiquai-containerd.log}"
+
+# Use overlay2 first. If it fails, the script retries vfs.
+DOCKER_STORAGE_DRIVER="${DOCKER_STORAGE_DRIVER:-overlay2}"
+ALLOW_VFS_FALLBACK="${ALLOW_VFS_FALLBACK:-1}"
+
+# Static network for the proxy container. Change if it conflicts with your environment.
+COMPOSE_SUBNET="${COMPOSE_SUBNET:-172.30.44.0/24}"
+PROXY_STATIC_IP="${PROXY_STATIC_IP:-172.30.44.10}"
+SOCAT_PID="${SOCAT_PID:-/var/run/kiquai-hashtopolis-socat.pid}"
+SOCAT_LOG="${SOCAT_LOG:-/var/log/kiquai-hashtopolis-socat.log}"
+
+# Runtime controls.
+WIPE_DATA="${WIPE_DATA:-0}"
+FORCE_RECREATE="${FORCE_RECREATE:-0}"
+PULL_IMAGES="${PULL_IMAGES:-1}"
+SKIP_APT="${SKIP_APT:-0}"
+
+export DEBIAN_FRONTEND=noninteractive
+export DOCKER_HOST="unix://${DOCKER_SOCK}"
+
+#############
+# Utilities #
+#############
+
 log() { echo "[$(date +'%F %T')] $*"; }
 warn() { echo "WARNING: $*" >&2; }
 fatal() { echo "ERROR: $*" >&2; exit 1; }
 
-if [ "${DEBUG}" = "1" ]; then
-  set -x
-fi
-
-on_error() {
-  local exit_code=$?
-  local line_no=${1:-unknown}
-  echo >&2
-  echo "ERROR: run.sh failed at line ${line_no}, exit code ${exit_code}." >&2
-  echo "Collecting diagnostics..." >&2
-  diagnose || true
-  exit "${exit_code}"
+rand_secret() {
+  openssl rand -base64 48 | tr -d '=+/[:space:]' | cut -c1-32
 }
-trap 'on_error $LINENO' ERR
 
 require_root() {
   if [ "$(id -u)" -ne 0 ]; then
@@ -81,163 +85,146 @@ require_root() {
   fi
 }
 
-rand_secret() {
-  # Keep the charset Compose/.env-safe to avoid interpolation surprises.
-  openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | cut -c1-32
+have_cmd() {
+  command -v "$1" >/dev/null 2>&1
 }
 
-apt_retry() {
-  local attempt
-  for attempt in 1 2 3; do
-    if apt-get "$@"; then
-      return 0
-    fi
-    warn "apt-get $* failed on attempt ${attempt}/3; retrying..."
-    sleep $((attempt * 4))
-  done
-  return 1
+print_header() {
+  cat <<'EOM'
+============================================================
+KiQuai Hashtopolis + Hashcat bootstrap for Vast.ai
+Mode: rootful Docker-in-Docker safe mode
+============================================================
+EOM
 }
 
-safe_env_value() {
-  local name="$1"
-  local value="$2"
-  if [[ "${value}" =~ [[:space:]] || "${value}" == *\"* || "${value}" == *"'"* || "${value}" == *'$'* || "${value}" == *\\* ]]; then
-    fatal "${name} contains unsupported characters for this one-line .env deployment. Use only letters, numbers, dot, dash, underscore, colon, slash, at-sign, percent."
+show_environment_summary() {
+  cat <<EOF2
+Runtime summary:
+  APP_DIR=${APP_DIR}
+  INTERNAL_PORT=${INTERNAL_PORT}
+  PUBLIC_URL=${PUBLIC_URL}
+  DOCKER_HOST=${DOCKER_HOST}
+  DOCKER_DATA_ROOT=${DOCKER_DATA_ROOT}
+  DOCKER_STORAGE_DRIVER=${DOCKER_STORAGE_DRIVER}
+  COMPOSE_SUBNET=${COMPOSE_SUBNET}
+  PROXY_STATIC_IP=${PROXY_STATIC_IP}
+  Backend image=${HASHTOPOLIS_BACKEND_IMAGE}
+  Frontend image=${HASHTOPOLIS_FRONTEND_IMAGE}
+  DB image=${DB_IMAGE}
+EOF2
+}
+
+on_error() {
+  local exit_code=$?
+  echo >&2
+  echo "============================================================" >&2
+  echo "Deployment failed with exit code ${exit_code}" >&2
+  echo "============================================================" >&2
+  dump_diagnostics || true
+  exit "${exit_code}"
+}
+trap on_error ERR
+
+################
+# Diagnostics  #
+################
+
+dump_file_tail() {
+  local file="$1"
+  local lines="${2:-160}"
+  if [ -f "$file" ]; then
+    echo >&2
+    echo "==== tail -n ${lines} ${file} ====" >&2
+    tail -n "$lines" "$file" >&2 || true
   fi
 }
 
-write_env_kv() {
-  local key="$1"
-  local value="$2"
-  printf '%s=%s\n' "${key}" "${value}"
-}
+dump_diagnostics() {
+  echo >&2
+  echo "==== basic system info ====" >&2
+  uname -a >&2 || true
+  id >&2 || true
+  cat /etc/os-release >&2 || true
 
-as_docker_user() {
-  su -s /bin/bash "${DOCKER_USER}" -c "$*"
-}
+  echo >&2
+  echo "==== capability / namespace probes ====" >&2
+  grep -E 'Cap(Eff|Prm|Bnd)' /proc/self/status >&2 || true
+  sysctl kernel.unprivileged_userns_clone 2>/dev/null >&2 || true
+  unshare -Ur true >/dev/null 2>&1 && echo "userns probe: OK" >&2 || echo "userns probe: blocked" >&2
 
-compose() {
-  COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME}" docker compose -f "${APP_DIR}/docker-compose.yml" "$@"
-}
+  echo >&2
+  echo "==== listening ports ====" >&2
+  ss -ltnp >&2 || true
 
-service_container_names() {
-  printf '%s\n' hashtopolis-db hashtopolis-backend hashtopolis-frontend hashtopolis-proxy
-}
-
-container_exists() {
-  docker inspect "$1" >/dev/null 2>&1
-}
-
-container_field() {
-  local name="$1"
-  local format="$2"
-  docker inspect -f "${format}" "${name}" 2>/dev/null || true
-}
-
-container_health() {
-  local name="$1"
-  docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}no-healthcheck{{end}}' "${name}" 2>/dev/null || true
-}
-
-container_status() {
-  local name="$1"
-  docker inspect -f '{{.State.Status}}' "${name}" 2>/dev/null || true
-}
-
-http_code() {
-  curl -sS --max-time "${HTTP_TIMEOUT}" -o /dev/null -w '%{http_code}' "$1" 2>/dev/null || echo "000"
-}
-
-http_okish() {
-  local code="$1"
-  case "${code}" in
-    2*|3*|4*) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-#######################################
-# Diagnostics
-#######################################
-diagnose() {
-  echo "==================== BASIC ====================" >&2
-  echo "User: $(id || true)" >&2
-  echo "Kernel: $(uname -a || true)" >&2
-  echo "APP_DIR=${APP_DIR}" >&2
-  echo "DOCKER_HOST=${DOCKER_HOST:-unset}" >&2
-  echo "PUBLIC_URL=${PUBLIC_URL}" >&2
-  echo "INTERNAL_PORT=${INTERNAL_PORT}" >&2
-
-  echo "==================== GPU ======================" >&2
-  if command -v nvidia-smi >/dev/null 2>&1; then
-    nvidia-smi >&2 || true
-  else
-    echo "nvidia-smi not found" >&2
-  fi
-
-  echo "==================== DOCKER ===================" >&2
-  docker version >&2 || true
+  echo >&2
+  echo "==== docker info ====" >&2
   docker info >&2 || true
 
   if [ -d "${APP_DIR}" ]; then
-    echo "==================== COMPOSE CONFIG ===========" >&2
-    (cd "${APP_DIR}" && COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME}" docker compose config) >&2 || true
+    echo >&2
+    echo "==== docker compose ps ====" >&2
+    (cd "${APP_DIR}" && docker compose ps -a) >&2 || true
 
-    echo "==================== COMPOSE PS ===============" >&2
-    compose ps -a >&2 || true
+    for svc in hashtopolis-db hashtopolis-backend hashtopolis-frontend hashtopolis-proxy; do
+      echo >&2
+      echo "==== logs: ${svc} ====" >&2
+      docker logs --tail 180 "${svc}" >&2 || true
+      echo >&2
+      echo "==== inspect: ${svc} ====" >&2
+      docker inspect --format='name={{.Name}} state={{.State.Status}} exit={{.State.ExitCode}} error={{.State.Error}} oom={{.State.OOMKilled}} started={{.State.StartedAt}} finished={{.State.FinishedAt}} ip={{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${svc}" >&2 || true
+    done
   fi
 
-  echo "==================== PORTS ====================" >&2
-  ss -ltnp >&2 || true
+  dump_file_tail "${DOCKER_LOG}" 220
+  dump_file_tail "${CONTAINERD_LOG}" 120
+  dump_file_tail "${SOCAT_LOG}" 120
+}
 
-  echo "==================== CONTAINER LOGS ===========" >&2
-  for c in $(service_container_names); do
-    if container_exists "${c}"; then
-      echo "----- ${c}: inspect state -----" >&2
-      docker inspect -f 'status={{.State.Status}} exit={{.State.ExitCode}} restart={{.RestartCount}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}no-healthcheck{{end}} oom={{.State.OOMKilled}} error={{.State.Error}}' "${c}" >&2 || true
-      echo "----- ${c}: logs last 160 lines -----" >&2
-      docker logs --tail 160 "${c}" >&2 || true
-    fi
-  done
+########################
+# Preflight and APT    #
+########################
 
-  local uid home log_file
-  if id "${DOCKER_USER}" >/dev/null 2>&1; then
-    uid="$(id -u "${DOCKER_USER}")"
-    home="$(getent passwd "${DOCKER_USER}" | cut -d: -f6)"
-    log_file="${home}/dockerd-rootless.log"
-    if [ -f "${log_file}" ]; then
-      echo "==================== ROOTLESS DOCKERD LOG =====" >&2
-      tail -n 240 "${log_file}" >&2 || true
-    fi
-    if [ -d "/run/user/${uid}" ]; then
-      echo "Runtime dir: /run/user/${uid}" >&2
-      ls -la "/run/user/${uid}" >&2 || true
-    fi
+validate_vast_options() {
+  if [ -z "${PUBLIC_PORT_DETECTED}" ] && [ -z "${PUBLIC_URL_OVERRIDE}" ]; then
+    warn "${PUBLIC_PORT_VAR} is not set. Vast.ai may have mapped ${INTERNAL_PORT} to a random external port."
+    warn "If the final URL is wrong, rerun with PUBLIC_URL='http://PUBLIC_IP:EXTERNAL_PORT'."
+  fi
+
+  if ss -ltnH "sport = :${INTERNAL_PORT}" 2>/dev/null | grep -q .; then
+    warn "Port ${INTERNAL_PORT} is already listening before deployment."
+    ss -ltnp "sport = :${INTERNAL_PORT}" || true
+    fatal "Choose a different INTERNAL_PORT or stop the process occupying this port."
   fi
 }
 
-#######################################
-# Host and GPU preparation
-#######################################
-install_system_packages() {
-  log "[1/9] Installing system packages"
+validate_gpu() {
+  log "[1/12] Validating GPU"
+  if ! have_cmd nvidia-smi; then
+    fatal "nvidia-smi is not installed. Use a CUDA/NVIDIA Vast.ai image, e.g. nvidia/cuda:12.9.1-devel-ubuntu24.04."
+  fi
+  nvidia-smi || fatal "nvidia-smi failed. The Vast.ai instance does not expose GPU correctly."
+}
 
-  export DEBIAN_FRONTEND=noninteractive
-  apt_retry update
-  apt_retry install -y --no-install-recommends \
+install_packages() {
+  log "[2/12] Installing system packages"
+  if [ "${SKIP_APT}" = "1" ]; then
+    log "SKIP_APT=1; skipping apt installation."
+    return 0
+  fi
+
+  apt-get update
+  apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
     wget \
     gnupg \
     lsb-release \
     iptables \
+    iproute2 \
     kmod \
     procps \
-    iproute2 \
-    uidmap \
-    dbus-user-session \
-    fuse-overlayfs \
-    slirp4netns \
+    psmisc \
     bash \
     git \
     jq \
@@ -249,185 +236,209 @@ install_system_packages() {
     python3-psutil \
     p7zip-full \
     unzip \
+    socat \
     clinfo \
     ocl-icd-libopencl1 \
-    hashcat \
-    netcat-openbsd
-}
-
-validate_gpu_and_hashcat() {
-  log "[2/9] Validating GPU and Hashcat"
-
-  if [ "${SKIP_GPU_CHECK}" != "1" ]; then
-    command -v nvidia-smi >/dev/null 2>&1 || fatal "nvidia-smi is not installed. Use an NVIDIA/CUDA Vast.ai image."
-    nvidia-smi || fatal "nvidia-smi failed. The Vast.ai instance is not exposing the GPU correctly."
-  else
-    warn "SKIP_GPU_CHECK=1 is set; GPU validation skipped."
-  fi
-
-  if [ "${SKIP_HASHCAT_CHECK}" != "1" ]; then
-    command -v hashcat >/dev/null 2>&1 || fatal "hashcat is not installed."
-    hashcat --version || true
-    # hashcat -I may return non-zero on some OpenCL/runtime edge cases; show it but do not fail deployment.
-    hashcat -I || warn "hashcat -I did not complete successfully. The server can still deploy, but the agent/GPU runtime may need attention."
-  else
-    warn "SKIP_HASHCAT_CHECK=1 is set; Hashcat validation skipped."
-  fi
+    hashcat
 }
 
 install_docker_engine() {
-  log "[3/9] Installing Docker Engine and rootless extras"
-
-  if command -v docker >/dev/null 2>&1 && command -v dockerd-rootless.sh >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
-    log "Docker CLI, Compose plugin, and rootless extras are already installed."
+  log "[3/12] Installing Docker Engine"
+  if have_cmd docker && have_cmd dockerd && docker compose version >/dev/null 2>&1; then
+    log "Docker Engine and Compose plugin already installed."
     return 0
   fi
 
-  . /etc/os-release
-  local codename="${VERSION_CODENAME:-}"
-  if [ -z "${codename}" ]; then
-    fatal "Cannot detect Ubuntu/Debian VERSION_CODENAME from /etc/os-release."
+  install -m 0755 -d /etc/apt/keyrings
+  if [ ! -f /etc/apt/keyrings/docker.asc ]; then
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+    chmod a+r /etc/apt/keyrings/docker.asc
   fi
 
-  install -m 0755 -d /etc/apt/keyrings
-  curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
-  chmod a+r /etc/apt/keyrings/docker.asc
-
-  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu ${codename} stable" \
+  . /etc/os-release
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu ${VERSION_CODENAME} stable" \
     > /etc/apt/sources.list.d/docker.list
 
-  apt_retry update
-  apt_retry install -y --no-install-recommends \
+  apt-get update
+  apt-get install -y --no-install-recommends \
     docker-ce \
     docker-ce-cli \
-    docker-ce-rootless-extras \
     containerd.io \
     docker-buildx-plugin \
     docker-compose-plugin
 }
 
-#######################################
-# Rootless Docker
-#######################################
-prepare_rootless_user() {
-  log "[4/9] Preparing rootless Docker user"
+############################
+# Rootful dockerd startup   #
+############################
 
-  if ! id "${DOCKER_USER}" >/dev/null 2>&1; then
-    useradd -m -s /bin/bash "${DOCKER_USER}"
+stop_old_runtime_processes() {
+  log "[4/12] Cleaning stale local Docker/socat processes"
+
+  if [ -f "${SOCAT_PID}" ]; then
+    kill "$(cat "${SOCAT_PID}")" 2>/dev/null || true
+    rm -f "${SOCAT_PID}"
   fi
 
-  DOCKER_UID="$(id -u "${DOCKER_USER}")"
-  DOCKER_GID="$(id -g "${DOCKER_USER}")"
-  DOCKER_HOME="$(getent passwd "${DOCKER_USER}" | cut -d: -f6)"
-  XDG_RUNTIME_DIR="/run/user/${DOCKER_UID}"
-  ROOTLESS_DOCKER_SOCK="${XDG_RUNTIME_DIR}/docker.sock"
-  export XDG_RUNTIME_DIR
-  export DOCKER_HOST="unix://${ROOTLESS_DOCKER_SOCK}"
-
-  mkdir -p "${XDG_RUNTIME_DIR}"
-  chown "${DOCKER_UID}:${DOCKER_GID}" "${XDG_RUNTIME_DIR}"
-  chmod 700 "${XDG_RUNTIME_DIR}"
-
-  mkdir -p "${DOCKER_HOME}/.local/share/docker" "${DOCKER_HOME}/.config/docker"
-  chown -R "${DOCKER_UID}:${DOCKER_GID}" "${DOCKER_HOME}/.local" "${DOCKER_HOME}/.config"
-
-  # Rootless Docker requires subordinate UID/GID ranges.
-  if ! grep -q "^${DOCKER_USER}:" /etc/subuid 2>/dev/null; then
-    echo "${DOCKER_USER}:100000:65536" >> /etc/subuid
-  fi
-  if ! grep -q "^${DOCKER_USER}:" /etc/subgid 2>/dev/null; then
-    echo "${DOCKER_USER}:100000:65536" >> /etc/subgid
+  if [ -f "${DOCKER_PID}" ]; then
+    kill "$(cat "${DOCKER_PID}")" 2>/dev/null || true
+    sleep 2 || true
+    rm -f "${DOCKER_PID}"
   fi
 
-  command -v newuidmap >/dev/null 2>&1 || fatal "newuidmap is missing; uidmap package is required for rootless Docker."
-  command -v newgidmap >/dev/null 2>&1 || fatal "newgidmap is missing; uidmap package is required for rootless Docker."
-  command -v slirp4netns >/dev/null 2>&1 || fatal "slirp4netns is missing; required for rootless Docker networking."
-  command -v fuse-overlayfs >/dev/null 2>&1 || fatal "fuse-overlayfs is missing; required for reliable rootless Docker storage."
-
-  # Best effort. Some container templates block sysctl writes; the unshare test below is authoritative.
-  sysctl -w kernel.unprivileged_userns_clone=1 >/dev/null 2>&1 || true
-
-  if ! as_docker_user "XDG_RUNTIME_DIR='${XDG_RUNTIME_DIR}' unshare -Ur true" >/dev/null 2>&1; then
-    cat >&2 <<EOF
-ERROR: unprivileged user namespaces are not available in this Vast.ai instance.
-Rootless Docker cannot run here.
-
-Fix options:
-  1. Confirm the Vast.ai template Docker options include: --privileged -p ${INTERNAL_PORT}:${INTERNAL_PORT} -e OPEN_BUTTON_PORT=${INTERNAL_PORT} --shm-size=8g
-  2. Try a different Vast.ai offer/provider where user namespaces are not blocked.
-  3. Avoid nested Docker and deploy Hashtopolis on a native VM/bare-metal host.
-EOF
-    exit 1
-  fi
+  # Only kill daemons using our custom socket/path/log when possible.
+  pkill -f "dockerd.*${DOCKER_SOCK}" 2>/dev/null || true
+  pkill -f "socat.*${PROXY_STATIC_IP}:80" 2>/dev/null || true
+  rm -f "${DOCKER_SOCK}"
 }
 
-start_rootless_docker() {
-  log "[5/9] Starting rootless Docker daemon"
-
-  export DOCKER_HOST="unix://${ROOTLESS_DOCKER_SOCK}"
-
-  if docker info >/dev/null 2>&1; then
-    if [ "${RESTART_ROOTLESS_DOCKER}" = "1" ]; then
-      log "Rootless Docker is already running but RESTART_ROOTLESS_DOCKER=1; restarting it."
-    else
-      log "Rootless Docker is already running."
-      docker info --format 'Docker driver={{.Driver}} security={{json .SecurityOptions}}' || true
-      return 0
-    fi
+start_containerd_if_needed() {
+  if pgrep -x containerd >/dev/null 2>&1; then
+    log "containerd is already running."
+    return 0
   fi
 
-  pkill -u "${DOCKER_UID}" -f rootlesskit 2>/dev/null || true
-  pkill -u "${DOCKER_UID}" -f dockerd 2>/dev/null || true
-  rm -f "${ROOTLESS_DOCKER_SOCK}"
-
-  as_docker_user "
-    export XDG_RUNTIME_DIR='${XDG_RUNTIME_DIR}'
-    export PATH='/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin'
-    export DOCKERD_ROOTLESS_ROOTLESSKIT_NET='slirp4netns'
-    export DOCKERD_ROOTLESS_ROOTLESSKIT_PORT_DRIVER='builtin'
-    nohup dockerd-rootless.sh \
-      --host='unix://${ROOTLESS_DOCKER_SOCK}' \
-      --storage-driver='fuse-overlayfs' \
-      --iptables=false \
-      > '${DOCKER_HOME}/dockerd-rootless.log' 2>&1 &
-  "
-
-  local i
-  for i in $(seq 1 120); do
-    if docker info >/dev/null 2>&1; then
-      break
+  log "Starting containerd"
+  nohup containerd > "${CONTAINERD_LOG}" 2>&1 &
+  for _ in $(seq 1 30); do
+    if pgrep -x containerd >/dev/null 2>&1; then
+      return 0
     fi
     sleep 1
   done
 
-  if ! docker info >/dev/null 2>&1; then
-    echo "ERROR: rootless dockerd failed to start." >&2
-    echo "==== ${DOCKER_HOME}/dockerd-rootless.log ====" >&2
-    cat "${DOCKER_HOME}/dockerd-rootless.log" >&2 || true
-    exit 1
-  fi
-
-  cat > /etc/profile.d/kiquai-rootless-docker.sh <<EOF
-export DOCKER_HOST=unix://${ROOTLESS_DOCKER_SOCK}
-export COMPOSE_PROJECT_NAME=${COMPOSE_PROJECT_NAME}
-EOF
-
-  log "Rootless Docker is ready."
-  docker info --format 'Docker driver={{.Driver}} security={{json .SecurityOptions}}' || true
+  fatal "containerd failed to start."
 }
 
-#######################################
-# Hashtopolis stack
-#######################################
-prepare_app_dir_and_env() {
-  log "[6/9] Preparing Hashtopolis app directory and environment"
+mount_cgroup_best_effort() {
+  # Docker may need cgroup information in nested container environments.
+  # In many Vast.ai templates this is already mounted. If it is read-only or blocked,
+  # this best-effort step is allowed to fail; the later docker smoke test is decisive.
+  if [ -d /sys/fs/cgroup ] && mountpoint -q /sys/fs/cgroup; then
+    log "cgroup filesystem is already mounted."
+    return 0
+  fi
+
+  mkdir -p /sys/fs/cgroup || true
+  mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null || true
+}
+
+start_dockerd_with_driver() {
+  local driver="$1"
+
+  mkdir -p "${DOCKER_DATA_ROOT}" "${DOCKER_EXEC_ROOT}" "$(dirname "${DOCKER_SOCK}")"
+  rm -f "${DOCKER_SOCK}" "${DOCKER_PID}"
+
+  log "Starting dockerd with storage-driver=${driver}"
+  cat > /etc/profile.d/kiquai-rootful-docker.sh <<EOF2
+export DOCKER_HOST=unix://${DOCKER_SOCK}
+EOF2
+
+  # Key flags:
+  # --iptables=false / --ip-masq=false: avoid NAT chain DOCKER failures in nested containers.
+  # --bridge=none: avoid default docker0 setup; Compose creates a user-defined bridge later.
+  # No port publishing is used. A host-level socat proxy exposes ${INTERNAL_PORT}.
+  nohup dockerd \
+    --host="unix://${DOCKER_SOCK}" \
+    --pidfile="${DOCKER_PID}" \
+    --data-root="${DOCKER_DATA_ROOT}" \
+    --exec-root="${DOCKER_EXEC_ROOT}" \
+    --storage-driver="${driver}" \
+    --iptables=false \
+    --ip6tables=false \
+    --ip-masq=false \
+    --bridge=none \
+    --userland-proxy=false \
+    --debug \
+    > "${DOCKER_LOG}" 2>&1 &
+
+  for _ in $(seq 1 90); do
+    if docker info >/dev/null 2>&1; then
+      DOCKER_STORAGE_DRIVER="${driver}"
+      return 0
+    fi
+    sleep 1
+  done
+
+  return 1
+}
+
+start_dockerd() {
+  log "[5/12] Starting rootful Docker daemon safe mode"
+  mount_cgroup_best_effort
+  start_containerd_if_needed
+
+  if start_dockerd_with_driver "${DOCKER_STORAGE_DRIVER}"; then
+    log "dockerd is ready with ${DOCKER_STORAGE_DRIVER}."
+  else
+    warn "dockerd failed with storage-driver=${DOCKER_STORAGE_DRIVER}."
+    dump_file_tail "${DOCKER_LOG}" 120
+
+    if [ "${ALLOW_VFS_FALLBACK}" = "1" ] && [ "${DOCKER_STORAGE_DRIVER}" != "vfs" ]; then
+      warn "Retrying dockerd with storage-driver=vfs. This is slower but often works in restricted nested environments."
+      pkill -f "dockerd.*${DOCKER_SOCK}" 2>/dev/null || true
+      sleep 3
+      if ! start_dockerd_with_driver "vfs"; then
+        fatal "dockerd failed with both ${DOCKER_STORAGE_DRIVER} and vfs. This Vast.ai offer/template does not support nested Docker enough."
+      fi
+    else
+      fatal "dockerd failed to start."
+    fi
+  fi
+
+  docker info --format 'Docker ready: server={{.ServerVersion}} driver={{.Driver}} cgroup={{.CgroupDriver}} root={{.DockerRootDir}}'
+}
+
+smoke_test_docker_network() {
+  log "[6/12] Running Docker smoke tests"
+  docker version
+
+  # Pulling proves the daemon can reach registries from the host namespace.
+  docker pull hello-world:latest >/dev/null
+
+  # Running proves runc/cgroups/mounts work.
+  docker run --rm --network none hello-world:latest >/dev/null
+
+  # User-defined bridge proves Compose service networking can work without Docker iptables NAT.
+  docker network rm kiquai-smoke-net >/dev/null 2>&1 || true
+  docker network create --driver bridge --subnet 172.30.45.0/24 kiquai-smoke-net >/dev/null
+  docker run -d --rm --name kiquai-smoke-nginx --network kiquai-smoke-net --ip 172.30.45.10 nginx:1.27-alpine >/dev/null
+  for _ in $(seq 1 30); do
+    if curl -fsS --max-time 2 http://172.30.45.10 >/dev/null 2>&1; then
+      docker rm -f kiquai-smoke-nginx >/dev/null 2>&1 || true
+      docker network rm kiquai-smoke-net >/dev/null 2>&1 || true
+      log "Docker network smoke test passed."
+      return 0
+    fi
+    sleep 1
+  done
+
+  docker logs kiquai-smoke-nginx || true
+  docker rm -f kiquai-smoke-nginx >/dev/null 2>&1 || true
+  docker network rm kiquai-smoke-net >/dev/null 2>&1 || true
+  fatal "Docker user-defined bridge is not reachable from host. Provider likely blocks nested network namespace/bridge even with --privileged."
+}
+
+############################
+# Hashtopolis stack files  #
+############################
+
+prepare_app_dir() {
+  log "[7/12] Preparing Hashtopolis app directory"
+
+  if [ "${WIPE_DATA}" = "1" ]; then
+    warn "WIPE_DATA=1: removing ${APP_DIR} and Docker volumes for this stack."
+    if [ -d "${APP_DIR}" ]; then
+      (cd "${APP_DIR}" && docker compose down -v --remove-orphans) || true
+    fi
+    rm -rf "${APP_DIR}"
+  fi
 
   mkdir -p "${APP_DIR}"
-  chown -R "${DOCKER_UID}:${DOCKER_GID}" "${APP_DIR}"
   cd "${APP_DIR}"
 
   if [ -f .env ]; then
-    log "Existing .env found; preserving existing database/admin secrets where present."
+    log "Existing .env found; preserving credentials unless environment overrides them."
     set -a
     # shellcheck disable=SC1091
     . ./.env
@@ -440,62 +451,38 @@ prepare_app_dir_and_env() {
   MYSQL_PASSWORD="${MYSQL_PASSWORD:-$(rand_secret)}"
   HASHTOPOLIS_ADMIN_USER="${HASHTOPOLIS_ADMIN_USER:-${HASHTOPOLIS_ADMIN_USER_DEFAULT}}"
   HASHTOPOLIS_ADMIN_PASSWORD="${HASHTOPOLIS_ADMIN_PASSWORD:-$(rand_secret)}"
-  HASHTOPOLIS_DB_HOST="${HASHTOPOLIS_DB_HOST:-db}"
+  HASHTOPOLIS_APIV2_ENABLE="${HASHTOPOLIS_APIV2_ENABLE:-1}"
+  HASHTOPOLIS_BACKEND_URL="${HASHTOPOLIS_BACKEND_URL:-${PUBLIC_URL}/api/v2}"
 
-  safe_env_value MYSQL_ROOT_PASS "${MYSQL_ROOT_PASS}"
-  safe_env_value MYSQL_DATABASE "${MYSQL_DATABASE}"
-  safe_env_value MYSQL_USER "${MYSQL_USER}"
-  safe_env_value MYSQL_PASSWORD "${MYSQL_PASSWORD}"
-  safe_env_value HASHTOPOLIS_ADMIN_USER "${HASHTOPOLIS_ADMIN_USER}"
-  safe_env_value HASHTOPOLIS_ADMIN_PASSWORD "${HASHTOPOLIS_ADMIN_PASSWORD}"
-  safe_env_value HASHTOPOLIS_BACKEND_URL "${HASHTOPOLIS_BACKEND_URL}"
-  safe_env_value PUBLIC_URL "${PUBLIC_URL}"
-
-  {
-    write_env_kv COMPOSE_PROJECT_NAME "${COMPOSE_PROJECT_NAME}"
-    write_env_kv INTERNAL_PORT "${INTERNAL_PORT}"
-    write_env_kv PUBLIC_URL "${PUBLIC_URL}"
-    write_env_kv PUBLIC_IP "${PUBLIC_IP}"
-    write_env_kv PUBLIC_PORT "${PUBLIC_PORT}"
-    write_env_kv DB_IMAGE "${DB_IMAGE}"
-    write_env_kv HASHTOPOLIS_BACKEND_IMAGE "${HASHTOPOLIS_BACKEND_IMAGE}"
-    write_env_kv HASHTOPOLIS_FRONTEND_IMAGE "${HASHTOPOLIS_FRONTEND_IMAGE}"
-    write_env_kv NGINX_IMAGE "${NGINX_IMAGE}"
-    write_env_kv MYSQL_ROOT_PASS "${MYSQL_ROOT_PASS}"
-    write_env_kv MYSQL_DATABASE "${MYSQL_DATABASE}"
-    write_env_kv MYSQL_USER "${MYSQL_USER}"
-    write_env_kv MYSQL_PASSWORD "${MYSQL_PASSWORD}"
-    write_env_kv HASHTOPOLIS_DB_HOST "${HASHTOPOLIS_DB_HOST}"
-    write_env_kv HASHTOPOLIS_ADMIN_USER "${HASHTOPOLIS_ADMIN_USER}"
-    write_env_kv HASHTOPOLIS_ADMIN_PASSWORD "${HASHTOPOLIS_ADMIN_PASSWORD}"
-    write_env_kv HASHTOPOLIS_BACKEND_URL "${HASHTOPOLIS_BACKEND_URL}"
-    write_env_kv HASHTOPOLIS_FRONTEND_PORT "${HASHTOPOLIS_FRONTEND_PORT}"
-  } > .env
-
-  chown "${DOCKER_UID}:${DOCKER_GID}" .env
+  cat > .env <<EOF2
+INTERNAL_PORT=${INTERNAL_PORT}
+PUBLIC_URL=${PUBLIC_URL}
+PUBLIC_PORT=${PUBLIC_PORT}
+COMPOSE_SUBNET=${COMPOSE_SUBNET}
+PROXY_STATIC_IP=${PROXY_STATIC_IP}
+HASHTOPOLIS_BACKEND_IMAGE=${HASHTOPOLIS_BACKEND_IMAGE}
+HASHTOPOLIS_FRONTEND_IMAGE=${HASHTOPOLIS_FRONTEND_IMAGE}
+DB_IMAGE=${DB_IMAGE}
+NGINX_IMAGE=${NGINX_IMAGE}
+MYSQL_ROOT_PASS=${MYSQL_ROOT_PASS}
+MYSQL_DATABASE=${MYSQL_DATABASE}
+MYSQL_USER=${MYSQL_USER}
+MYSQL_PASSWORD=${MYSQL_PASSWORD}
+HASHTOPOLIS_ADMIN_USER=${HASHTOPOLIS_ADMIN_USER}
+HASHTOPOLIS_ADMIN_PASSWORD=${HASHTOPOLIS_ADMIN_PASSWORD}
+HASHTOPOLIS_APIV2_ENABLE=${HASHTOPOLIS_APIV2_ENABLE}
+HASHTOPOLIS_BACKEND_URL=${HASHTOPOLIS_BACKEND_URL}
+EOF2
   chmod 600 .env
-
-  if [ -z "${PUBLIC_PORT_DETECTED}" ] && [ -z "${PUBLIC_URL_OVERRIDE}" ]; then
-    warn "${PUBLIC_PORT_VAR} is not set. Vast.ai may map internal ports to random external ports. If the printed URL is wrong, rerun with PUBLIC_URL=http://PUBLIC_IP:EXTERNAL_PORT."
-  fi
 }
 
-write_compose_and_nginx() {
-  log "[7/9] Writing docker-compose.yml, nginx.conf, and helper scripts"
-
+write_compose() {
+  log "[8/12] Writing docker-compose.yml and nginx.conf"
   cd "${APP_DIR}"
 
-  cat > docker-compose.yml <<'EOF'
-name: ${COMPOSE_PROJECT_NAME}
-
-x-logging: &default-logging
-  driver: json-file
-  options:
-    max-size: "10m"
-    max-file: "3"
-
+  cat > docker-compose.yml <<'EOF2'
 services:
-  db:
+  hashtopolis-db:
     image: ${DB_IMAGE}
     container_name: hashtopolis-db
     restart: unless-stopped
@@ -505,18 +492,17 @@ services:
       MYSQL_USER: ${MYSQL_USER}
       MYSQL_PASSWORD: ${MYSQL_PASSWORD}
     command:
-      - --character-set-server=utf8mb4
-      - --collation-server=utf8mb4_unicode_ci
-      - --max_allowed_packet=1073741824
+      - --max_allowed_packet=1G
     volumes:
-      - db:/var/lib/mysql
+      - hash_db:/var/lib/mysql
     healthcheck:
-      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$${MYSQL_ROOT_PASSWORD} --silent || exit 1"]
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$${MYSQL_ROOT_PASSWORD} --silent"]
       interval: 10s
       timeout: 5s
       retries: 60
-      start_period: 45s
-    logging: *default-logging
+      start_period: 30s
+    networks:
+      hashtopolis-net:
 
   hashtopolis-backend:
     image: ${HASHTOPOLIS_BACKEND_IMAGE}
@@ -524,26 +510,28 @@ services:
     restart: unless-stopped
     environment:
       HASHTOPOLIS_DB_TYPE: mysql
+      HASHTOPOLIS_DB_HOST: hashtopolis-db
       HASHTOPOLIS_DB_USER: ${MYSQL_USER}
       HASHTOPOLIS_DB_PASS: ${MYSQL_PASSWORD}
-      HASHTOPOLIS_DB_HOST: ${HASHTOPOLIS_DB_HOST}
       HASHTOPOLIS_DB_DATABASE: ${MYSQL_DATABASE}
       HASHTOPOLIS_ADMIN_USER: ${HASHTOPOLIS_ADMIN_USER}
       HASHTOPOLIS_ADMIN_PASSWORD: ${HASHTOPOLIS_ADMIN_PASSWORD}
       HASHTOPOLIS_BACKEND_URL: ${HASHTOPOLIS_BACKEND_URL}
-      HASHTOPOLIS_FRONTEND_PORT: ${HASHTOPOLIS_FRONTEND_PORT}
+      HASHTOPOLIS_FRONTEND_PORT: ${PUBLIC_PORT}
+      HASHTOPOLIS_APIV2_ENABLE: ${HASHTOPOLIS_APIV2_ENABLE}
     volumes:
-      - hashtopolis:/usr/local/share/hashtopolis
+      - hash_data:/usr/local/share/hashtopolis
     depends_on:
-      db:
+      hashtopolis-db:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "php -r 'exit(@fsockopen(\"127.0.0.1\", 80) ? 0 : 1);'"]
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1/api/v2 >/dev/null || curl -fsS http://127.0.0.1/api/server.php >/dev/null || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 60
-      start_period: 60s
-    logging: *default-logging
+      start_period: 45s
+    networks:
+      hashtopolis-net:
 
   hashtopolis-frontend:
     image: ${HASHTOPOLIS_FRONTEND_IMAGE}
@@ -553,286 +541,244 @@ services:
       HASHTOPOLIS_BACKEND_URL: ${HASHTOPOLIS_BACKEND_URL}
     depends_on:
       hashtopolis-backend:
-        condition: service_healthy
-    logging: *default-logging
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 20s
+    networks:
+      hashtopolis-net:
 
   hashtopolis-proxy:
     image: ${NGINX_IMAGE}
     container_name: hashtopolis-proxy
     restart: unless-stopped
-    ports:
-      - "${INTERNAL_PORT}:80"
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
     depends_on:
-      hashtopolis-backend:
-        condition: service_healthy
       hashtopolis-frontend:
         condition: service_started
+      hashtopolis-backend:
+        condition: service_started
     healthcheck:
-      test: ["CMD-SHELL", "wget --spider -q http://127.0.0.1/ || exit 1"]
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/ || exit 1"]
       interval: 10s
       timeout: 5s
-      retries: 30
-      start_period: 20s
-    logging: *default-logging
+      retries: 60
+      start_period: 10s
+    networks:
+      hashtopolis-net:
+        ipv4_address: ${PROXY_STATIC_IP}
 
 volumes:
-  db:
-  hashtopolis:
-EOF
+  hash_db:
+  hash_data:
 
-  cat > nginx.conf <<'EOF'
-events {
-  worker_connections 1024;
-}
+networks:
+  hashtopolis-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${COMPOSE_SUBNET}
+EOF2
+
+  cat > nginx.conf <<'EOF2'
+events {}
 
 http {
   client_max_body_size 20G;
-  proxy_connect_timeout 60s;
-  proxy_send_timeout 3600s;
   proxy_read_timeout 3600s;
-  send_timeout 3600s;
+  proxy_send_timeout 3600s;
+  proxy_connect_timeout 120s;
 
-  upstream hashtopolis_frontend {
+  upstream frontend {
     server hashtopolis-frontend:80;
   }
 
-  upstream hashtopolis_backend {
+  upstream backend {
     server hashtopolis-backend:80;
   }
 
   server {
     listen 80;
-    server_name _;
 
-    # Lightweight local readiness endpoint for the proxy container.
-    location = /__kiquai_health {
-      access_log off;
+    location = /healthz {
       return 200 "ok\n";
       add_header Content-Type text/plain;
     }
 
-    # Hashtopolis API v2. Keep the path unchanged.
-    location = /api/v2 {
-      proxy_pass http://hashtopolis_backend/api/v2;
+    location /api/v2 {
+      proxy_pass http://backend/api/v2;
       proxy_set_header Host $host;
       proxy_set_header X-Real-IP $remote_addr;
       proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
       proxy_set_header X-Forwarded-Proto $scheme;
-      proxy_set_header X-Forwarded-Host $host;
     }
 
-    location /api/v2/ {
-      proxy_pass http://hashtopolis_backend/api/v2/;
+    location /api/server.php {
+      proxy_pass http://backend/api/server.php;
       proxy_set_header Host $host;
       proxy_set_header X-Real-IP $remote_addr;
       proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
       proxy_set_header X-Forwarded-Proto $scheme;
-      proxy_set_header X-Forwarded-Host $host;
-    }
-
-    # Legacy agent API.
-    location = /api/server.php {
-      proxy_pass http://hashtopolis_backend/api/server.php;
-      proxy_set_header Host $host;
-      proxy_set_header X-Real-IP $remote_addr;
-      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-      proxy_set_header X-Forwarded-Proto $scheme;
-      proxy_set_header X-Forwarded-Host $host;
     }
 
     location /api/ {
-      proxy_pass http://hashtopolis_backend/api/;
+      proxy_pass http://backend/api/;
       proxy_set_header Host $host;
       proxy_set_header X-Real-IP $remote_addr;
       proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
       proxy_set_header X-Forwarded-Proto $scheme;
-      proxy_set_header X-Forwarded-Host $host;
     }
 
-    # Files and binaries are served by the backend.
-    location /files/ {
-      proxy_pass http://hashtopolis_backend/files/;
-      proxy_set_header Host $host;
-      proxy_set_header X-Real-IP $remote_addr;
-      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-      proxy_set_header X-Forwarded-Proto $scheme;
-      proxy_set_header X-Forwarded-Host $host;
-    }
-
-    location /binaries/ {
-      proxy_pass http://hashtopolis_backend/binaries/;
-      proxy_set_header Host $host;
-      proxy_set_header X-Real-IP $remote_addr;
-      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-      proxy_set_header X-Forwarded-Proto $scheme;
-      proxy_set_header X-Forwarded-Host $host;
-    }
-
-    # Angular frontend.
     location / {
-      proxy_pass http://hashtopolis_frontend/;
-      proxy_http_version 1.1;
+      proxy_pass http://frontend/;
       proxy_set_header Host $host;
       proxy_set_header X-Real-IP $remote_addr;
       proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
       proxy_set_header X-Forwarded-Proto $scheme;
-      proxy_set_header X-Forwarded-Host $host;
     }
   }
 }
-EOF
+EOF2
 
-  cat > kiquai-status.sh <<'EOF'
+  cat > kiquai-logs.sh <<EOF2
 #!/usr/bin/env bash
-set -Eeuo pipefail
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "${SCRIPT_DIR}"
-if [ -f .env ]; then
-  set -a
-  . ./.env
-  set +a
-fi
-export DOCKER_HOST="${DOCKER_HOST:-$(grep -h '^export DOCKER_HOST=' /etc/profile.d/kiquai-rootless-docker.sh 2>/dev/null | cut -d= -f2- || true)}"
-export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-kiquai_hashtopolis}"
-docker compose ps -a
-printf '\nLocal UI: %s\n' "http://127.0.0.1:${INTERNAL_PORT:-8080}"
-printf 'Public UI: %s\n' "${PUBLIC_URL:-unknown}"
-EOF
-
-  cat > kiquai-logs.sh <<'EOF'
-#!/usr/bin/env bash
-set -Eeuo pipefail
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "${SCRIPT_DIR}"
-if [ -f .env ]; then
-  set -a
-  . ./.env
-  set +a
-fi
-export DOCKER_HOST="${DOCKER_HOST:-$(grep -h '^export DOCKER_HOST=' /etc/profile.d/kiquai-rootless-docker.sh 2>/dev/null | cut -d= -f2- || true)}"
-export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-kiquai_hashtopolis}"
-docker compose logs --tail 250 "$@"
-EOF
-
-  chmod +x kiquai-status.sh kiquai-logs.sh
-  chown "${DOCKER_UID}:${DOCKER_GID}" docker-compose.yml nginx.conf kiquai-status.sh kiquai-logs.sh
+set -u
+export DOCKER_HOST="unix://${DOCKER_SOCK}"
+cd "${APP_DIR}" || exit 1
+printf '\n==== docker compose ps -a ====\n'
+docker compose ps -a || true
+for svc in hashtopolis-db hashtopolis-backend hashtopolis-frontend hashtopolis-proxy; do
+  printf '\n==== logs: %s ====\n' "\$svc"
+  docker logs --tail 220 "\$svc" || true
+  printf '\n==== inspect: %s ====\n' "\$svc"
+  docker inspect --format='name={{.Name}} state={{.State.Status}} exit={{.State.ExitCode}} error={{.State.Error}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}} ip={{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "\$svc" || true
+done
+printf '\n==== dockerd log ====\n'
+tail -n 220 "${DOCKER_LOG}" || true
+printf '\n==== socat log ====\n'
+tail -n 120 "${SOCAT_LOG}" || true
+EOF2
+  chmod +x kiquai-logs.sh
 }
 
-preflight_compose() {
-  log "[8/9] Validating Compose config and port availability"
+############################
+# Deploy and expose        #
+############################
 
+pull_images() {
+  log "[9/12] Pulling images"
   cd "${APP_DIR}"
-  compose config >/dev/null
-
-  if [ "${WIPE_DATA}" = "1" ]; then
-    warn "WIPE_DATA=1: removing containers and volumes for a clean deployment."
-    compose down --volumes --remove-orphans || true
-  elif [ "${FORCE_RECREATE}" = "1" ]; then
-    log "Stopping previous KiQuai Hashtopolis containers, preserving volumes."
-    compose down --remove-orphans || true
-  fi
-
-  if command -v ss >/dev/null 2>&1 && ss -ltnH "sport = :${INTERNAL_PORT}" 2>/dev/null | grep -q .; then
-    echo "ERROR: port ${INTERNAL_PORT} is already listening inside this Vast.ai instance." >&2
-    echo "Common causes:" >&2
-    echo "  - Jupyter/template service already uses 8080." >&2
-    echo "  - Another application is already bound to this port." >&2
-    echo "Fix:" >&2
-    echo "  - Use SSH mode, or rerun with INTERNAL_PORT=18080 and expose -p 18080:18080." >&2
-    ss -ltnp "sport = :${INTERNAL_PORT}" >&2 || true
-    exit 1
+  if [ "${PULL_IMAGES}" = "1" ]; then
+    docker compose pull
+  else
+    log "PULL_IMAGES=0; skipping docker compose pull."
   fi
 }
 
-pull_and_start_stack() {
-  log "[9/9] Pulling images and starting Hashtopolis stack"
-
+start_stack() {
+  log "[10/12] Starting Hashtopolis stack"
   cd "${APP_DIR}"
+  docker compose config >/dev/null
 
-  log "Pulling images: ${DB_IMAGE}, ${HASHTOPOLIS_BACKEND_IMAGE}, ${HASHTOPOLIS_FRONTEND_IMAGE}, ${NGINX_IMAGE}"
-  compose pull
-  compose up -d --remove-orphans
+  if [ "${FORCE_RECREATE}" = "1" ]; then
+    docker compose up -d --force-recreate --remove-orphans
+  else
+    docker compose up -d --remove-orphans
+  fi
 }
 
-wait_for_stack() {
-  log "Waiting for containers to become healthy. Timeout: ${STARTUP_TIMEOUT}s"
+wait_for_container() {
+  local name="$1"
+  local max_seconds="${2:-180}"
+  local elapsed=0
 
-  local start now elapsed c status health restart_count exit_code oom error code all_ok
-  start="$(date +%s)"
+  while [ "${elapsed}" -lt "${max_seconds}" ]; do
+    local status health exit_code
+    status="$(docker inspect -f '{{.State.Status}}' "${name}" 2>/dev/null || echo missing)"
+    health="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "${name}" 2>/dev/null || echo missing)"
+    exit_code="$(docker inspect -f '{{.State.ExitCode}}' "${name}" 2>/dev/null || echo 999)"
 
-  while true; do
-    all_ok=1
-
-    for c in $(service_container_names); do
-      if ! container_exists "${c}"; then
-        all_ok=0
-        continue
-      fi
-
-      status="$(container_status "${c}")"
-      health="$(container_health "${c}")"
-      restart_count="$(container_field "${c}" '{{.RestartCount}}')"
-      exit_code="$(container_field "${c}" '{{.State.ExitCode}}')"
-      oom="$(container_field "${c}" '{{.State.OOMKilled}}')"
-      error="$(container_field "${c}" '{{.State.Error}}')"
-
-      if [ "${status}" = "exited" ] || [ "${status}" = "dead" ] || [ "${status}" = "removing" ]; then
-        echo "ERROR: ${c} is ${status}. exit=${exit_code} restart=${restart_count} oom=${oom} error=${error}" >&2
-        diagnose || true
-        exit 1
-      fi
-
-      if [ "${status}" != "running" ]; then
-        all_ok=0
-      fi
-
-      if [ "${health}" = "starting" ] || [ "${health}" = "unhealthy" ]; then
-        all_ok=0
-      fi
-    done
-
-    code="$(http_code "http://127.0.0.1:${INTERNAL_PORT}/__kiquai_health")"
-    if ! http_okish "${code}"; then
-      all_ok=0
-    fi
-
-    if [ "${all_ok}" = "1" ]; then
-      log "All containers are running and the local proxy responded with HTTP ${code}."
+    if [ "${status}" = "running" ] && { [ "${health}" = "healthy" ] || [ "${health}" = "none" ]; }; then
+      log "${name}: status=${status}, health=${health}"
       return 0
     fi
 
-    now="$(date +%s)"
-    elapsed=$((now - start))
-    if [ "${elapsed}" -ge "${STARTUP_TIMEOUT}" ]; then
-      echo "ERROR: stack did not become healthy within ${STARTUP_TIMEOUT}s." >&2
-      diagnose || true
-      exit 1
+    if [ "${status}" = "exited" ] || [ "${status}" = "dead" ]; then
+      warn "${name} is ${status} with exit_code=${exit_code}."
+      docker logs --tail 160 "${name}" || true
+      return 1
     fi
 
-    if [ $((elapsed % 20)) -eq 0 ]; then
-      log "Still waiting... elapsed=${elapsed}s"
-      compose ps -a || true
-    fi
-
-    sleep 2
+    sleep 5
+    elapsed=$((elapsed + 5))
   done
+
+  warn "Timed out waiting for ${name}."
+  docker inspect "${name}" || true
+  docker logs --tail 160 "${name}" || true
+  return 1
+}
+
+wait_for_stack() {
+  log "[11/12] Waiting for service health"
+  wait_for_container hashtopolis-db 300
+  wait_for_container hashtopolis-backend 300
+  wait_for_container hashtopolis-frontend 240
+  wait_for_container hashtopolis-proxy 240
+}
+
+start_socat_proxy() {
+  log "[12/12] Exposing Hashtopolis on host port ${INTERNAL_PORT} via socat"
+
+  if [ -f "${SOCAT_PID}" ]; then
+    kill "$(cat "${SOCAT_PID}")" 2>/dev/null || true
+    rm -f "${SOCAT_PID}"
+  fi
+  pkill -f "socat.*TCP-LISTEN:${INTERNAL_PORT}.*${PROXY_STATIC_IP}:80" 2>/dev/null || true
+
+  # Verify static container IP before starting the proxy.
+  local actual_ip
+  actual_ip="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' hashtopolis-proxy)"
+  if [ "${actual_ip}" != "${PROXY_STATIC_IP}" ]; then
+    fatal "hashtopolis-proxy IP is ${actual_ip}, expected ${PROXY_STATIC_IP}. Check COMPOSE_SUBNET/PROXY_STATIC_IP conflict."
+  fi
+
+  nohup socat \
+    TCP-LISTEN:"${INTERNAL_PORT}",fork,reuseaddr,bind=0.0.0.0 \
+    TCP:"${PROXY_STATIC_IP}":80 \
+    > "${SOCAT_LOG}" 2>&1 &
+  echo $! > "${SOCAT_PID}"
+
+  for _ in $(seq 1 60); do
+    if curl -fsS --max-time 3 "http://127.0.0.1:${INTERNAL_PORT}/healthz" >/dev/null 2>&1; then
+      log "Host-level HTTP proxy is ready."
+      return 0
+    fi
+    sleep 1
+  done
+
+  fatal "socat proxy did not become reachable on 127.0.0.1:${INTERNAL_PORT}."
+}
+
+check_hashcat() {
+  log "Checking Hashcat/OpenCL"
+  hashcat --version || true
+  hashcat -I || true
 }
 
 print_success() {
   cd "${APP_DIR}"
+  docker compose ps -a
 
-  local root_code api_code legacy_code
-  root_code="$(http_code "http://127.0.0.1:${INTERNAL_PORT}/")"
-  api_code="$(http_code "http://127.0.0.1:${INTERNAL_PORT}/api/v2")"
-  legacy_code="$(http_code "http://127.0.0.1:${INTERNAL_PORT}/api/server.php")"
-
-  cat <<EOF
+  cat <<EOF2
 
 ============================================================
-KiQuai Hashtopolis deployment completed.
-
+DEPLOYMENT COMPLETE
+============================================================
 Hashtopolis URL:
   ${PUBLIC_URL}
 
@@ -848,58 +794,55 @@ Backend API v2:
 Legacy agent API:
   ${PUBLIC_URL}/api/server.php
 
-Rootless Docker socket:
-  ${DOCKER_HOST}
+Important shell setup:
+  source /etc/profile.d/kiquai-rootful-docker.sh
 
-Images:
-  DB:       ${DB_IMAGE}
-  Backend:  ${HASHTOPOLIS_BACKEND_IMAGE}
-  Frontend: ${HASHTOPOLIS_FRONTEND_IMAGE}
-  Proxy:    ${NGINX_IMAGE}
-
-Local HTTP probes:
-  /                 -> HTTP ${root_code}
-  /api/v2           -> HTTP ${api_code}
-  /api/server.php   -> HTTP ${legacy_code}
-
-Operational commands:
-  export DOCKER_HOST=${DOCKER_HOST}
+Check containers:
   cd ${APP_DIR}
   docker compose ps -a
-  docker compose logs --tail 200 hashtopolis-backend
-  ./kiquai-status.sh
-  ./kiquai-logs.sh
 
-GPU checks:
+Check logs:
+  ${APP_DIR}/kiquai-logs.sh
+
+Check local HTTP:
+  curl -I http://127.0.0.1:${INTERNAL_PORT}
+  curl -I http://127.0.0.1:${INTERNAL_PORT}/api/v2
+  curl -I http://127.0.0.1:${INTERNAL_PORT}/api/server.php
+
+Check GPU and Hashcat:
   nvidia-smi
   hashcat -I
 
-Data reset, if you intentionally want a clean reinstall:
-  WIPE_DATA=1 bash run.sh
+Rootful Docker socket:
+  ${DOCKER_HOST}
 
-If the URL is wrong because Vast.ai used another external port:
-  PUBLIC_URL="http://PUBLIC_IP:EXTERNAL_PORT" bash run.sh
+Docker daemon log:
+  ${DOCKER_LOG}
+
+Socat proxy log:
+  ${SOCAT_LOG}
 ============================================================
-EOF
+EOF2
 }
 
 main() {
+  print_header
   require_root
-
-  log "KiQuai Hashtopolis + Hashcat bootstrap started."
-  log "Target public URL: ${PUBLIC_URL}"
-  log "Target internal port: ${INTERNAL_PORT}"
-
-  install_system_packages
-  validate_gpu_and_hashcat
+  show_environment_summary
+  validate_vast_options
+  validate_gpu
+  install_packages
   install_docker_engine
-  prepare_rootless_user
-  start_rootless_docker
-  prepare_app_dir_and_env
-  write_compose_and_nginx
-  preflight_compose
-  pull_and_start_stack
+  stop_old_runtime_processes
+  start_dockerd
+  smoke_test_docker_network
+  prepare_app_dir
+  write_compose
+  pull_images
+  start_stack
   wait_for_stack
+  start_socat_proxy
+  check_hashcat
   print_success
 }
 
