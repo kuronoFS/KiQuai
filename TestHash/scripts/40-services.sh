@@ -2,7 +2,7 @@
 # shellcheck shell=bash
 # KiQuai module: services
 # kiquai-module-api: 1
-# kiquai-release: 3.1.1
+# kiquai-release: 3.1.2
 
 if [[ "${KIQUAI_MODULE_CONTEXT:-0}" != "1" ]]; then
   printf 'This file is a KiQuai module; run ../run.sh instead.\n' >&2
@@ -119,6 +119,24 @@ wait_for_supervisor_running() {
   return 1
 }
 
+print_supervisor_program_diagnostics() {
+  local program="$1"
+  supervisor_ctl status "${program}" || true
+  tail -n 120 "${LOG_DIR}/supervisord.log" 2>/dev/null || true
+  case "${program}" in
+    backend)
+      printf '\n===== backend.log =====\n' >&2
+      tail -n 220 "${LOG_DIR}/backend.log" 2>/dev/null || true
+      printf '\n===== apache-error.log =====\n' >&2
+      tail -n 160 "${LOG_DIR}/apache-error.log" 2>/dev/null || true
+      ;;
+    nginx)
+      printf '\n===== nginx-error.log =====\n' >&2
+      tail -n 160 "${LOG_DIR}/nginx-error.log" 2>/dev/null || true
+      ;;
+  esac
+}
+
 restart_or_start_supervisor_program() {
   local program="$1"
   local timeout="$2"
@@ -152,7 +170,7 @@ restart_or_start_supervisor_program() {
       return 0
       ;;
     STARTING|BACKOFF|STOPPING)
-      supervisor_ctl status "${program}" || true
+      print_supervisor_program_diagnostics "${program}"
       die "Supervisor program '${program}' did not reach a restartable stopped state."
       ;;
   esac
@@ -161,22 +179,13 @@ restart_or_start_supervisor_program() {
     state="$(supervisor_program_state "${program}")"
     if [[ "${state}" != "RUNNING" && "${state}" != "STARTING" ]]; then
       [[ -n "${output}" ]] && printf '%s\n' "${output}" >&2
-      supervisor_ctl status "${program}" || true
+      print_supervisor_program_diagnostics "${program}"
       die "Supervisor could not start '${program}'."
     fi
   fi
 
   if ! wait_for_supervisor_running "${program}" "${timeout}"; then
-    supervisor_ctl status "${program}" || true
-    case "${program}" in
-      backend)
-        tail -n 160 "${LOG_DIR}/backend.log" 2>/dev/null || true
-        tail -n 120 "${LOG_DIR}/apache-error.log" 2>/dev/null || true
-        ;;
-      nginx)
-        tail -n 120 "${LOG_DIR}/nginx-error.log" 2>/dev/null || true
-        ;;
-    esac
+    print_supervisor_program_diagnostics "${program}"
     die "Supervisor program '${program}' did not reach RUNNING within ${timeout} seconds."
   fi
   success "Supervisor program '${program}' is running."

@@ -2,7 +2,7 @@
 # shellcheck shell=bash
 # KiQuai module: system
 # kiquai-module-api: 1
-# kiquai-release: 3.1.1
+# kiquai-release: 3.1.2
 
 if [[ "${KIQUAI_MODULE_CONTEXT:-0}" != "1" ]]; then
   printf 'This file is a KiQuai module; run ../run.sh instead.\n' >&2
@@ -257,13 +257,25 @@ validate_service_ports() {
   done
 }
 
+publish_sqlx_runtime_binary() {
+  local cached_binary="${TOOLS_DIR}/bin/sqlx"
+  [[ -x "${cached_binary}" ]] \
+    || die "The cached SQLx binary is missing: ${cached_binary}."
+
+  # Hashtopolis v1.0.0-rc2 setup.php invokes /usr/bin/sqlx explicitly. This
+  # mirrors the COPY --from=prebuild ... /usr/bin/ step in its Dockerfile.
+  install -m 755 "${cached_binary}" /usr/bin/sqlx
+  /usr/bin/sqlx --version
+}
+
 install_sqlx() {
   if [[ -x "${TOOLS_DIR}/bin/sqlx" ]]; then
-    "${TOOLS_DIR}/bin/sqlx" --version
+    publish_sqlx_runtime_binary
     return 0
   fi
   if have_cmd sqlx; then
     install -m 755 "$(command -v sqlx)" "${TOOLS_DIR}/bin/sqlx"
+    publish_sqlx_runtime_binary
     return 0
   fi
 
@@ -289,7 +301,7 @@ install_sqlx() {
     retry 2 10 "${cargo_home}/bin/cargo" install --locked sqlx-cli \
       --no-default-features --features native-tls,mysql --root "${TOOLS_DIR}"
   rm -rf "${temp}"
-  "${TOOLS_DIR}/bin/sqlx" --version
+  publish_sqlx_runtime_binary
 
   if [[ "${KEEP_BUILD_TOOLCHAINS}" == "0" ]]; then
     rm -rf "${build_root}"

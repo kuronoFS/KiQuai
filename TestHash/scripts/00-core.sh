@@ -2,7 +2,7 @@
 # shellcheck shell=bash
 # KiQuai module: core
 # kiquai-module-api: 1
-# kiquai-release: 3.1.1
+# kiquai-release: 3.1.2
 
 set -Eeuo pipefail
 shopt -s inherit_errexit 2>/dev/null || true
@@ -25,7 +25,7 @@ fi
 # This script intentionally does not install or start Docker, dockerd, Compose,
 # containerd, a nested network namespace, or a socat port forwarder.
 
-readonly SCRIPT_VERSION="3.1.1"
+readonly SCRIPT_VERSION="3.1.2"
 readonly SCRIPT_NAME="KiQuai Hashtopolis modular single-container bootstrap"
 readonly TOTAL_STEPS=10
 

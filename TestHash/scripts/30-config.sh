@@ -2,7 +2,7 @@
 # shellcheck shell=bash
 # KiQuai module: config
 # kiquai-module-api: 1
-# kiquai-release: 3.1.1
+# kiquai-release: 3.1.2
 
 if [[ "${KIQUAI_MODULE_CONTEXT:-0}" != "1" ]]; then
   printf 'This file is a KiQuai module; run ../run.sh instead.\n' >&2
@@ -225,6 +225,15 @@ export HASHTOPOLIS_DB_PASS="${MYSQL_PASSWORD}"
 export HASHTOPOLIS_DB_DATABASE="${MYSQL_DATABASE}"
 export HASHTOPOLIS_APIV2_ENABLE="1"
 
+[[ -x /usr/bin/sqlx ]] || {
+  echo "Required migration binary /usr/bin/sqlx is missing or not executable." >&2
+  exit 1
+}
+if ! runuser -u www-data -- test -w "${SERVER_CURRENT}/src/inc/utils/locks"; then
+  echo "Hashtopolis lock directory is not writable by www-data: ${SERVER_CURRENT}/src/inc/utils/locks" >&2
+  exit 1
+fi
+
 for _attempt in $(seq 1 120); do
   if MYSQL_PWD="${MYSQL_PASSWORD}" mysql --protocol=tcp \
       -h 127.0.0.1 -P "${DB_PORT}" -u "${MYSQL_USER}" \
@@ -238,8 +247,17 @@ for _attempt in $(seq 1 120); do
   sleep 2
 done
 
+echo "Starting Hashtopolis migration/setup."
+set +e
 runuser -u www-data --preserve-environment -- \
   php -f "${SERVER_CURRENT}/src/inc/startup/setup.php"
+setup_rc=$?
+set -e
+if (( setup_rc != 0 )); then
+  echo "Hashtopolis setup.php failed (exit=${setup_rc})." >&2
+  exit "${setup_rc}"
+fi
+echo "Hashtopolis migration/setup completed."
 exec /usr/sbin/apache2ctl -DFOREGROUND
 EOF
   sed -i "s|__ENV_FILE__|${ENV_FILE}|g" "${CONFIG_DIR}/start-backend.sh"

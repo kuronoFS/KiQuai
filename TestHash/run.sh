@@ -14,7 +14,7 @@ export KIQUAI_CONSOLE_FD
 # This file is intentionally small. It downloads, validates, caches, and loads
 # the version-matched scripts listed in scripts/manifest.sha256.
 
-readonly KIQUAI_LOADER_VERSION="3.1.1"
+readonly KIQUAI_LOADER_VERSION="3.1.2"
 readonly KIQUAI_MODULE_API="1"
 readonly -a KIQUAI_MODULES=(
   "00-core.sh"

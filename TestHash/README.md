@@ -1,6 +1,6 @@
 # KiQuai Hashtopolis + Hashcat trên Vast.ai
 
-KiQuai triển khai toàn bộ stack trực tiếp trong **một CUDA container gốc của Vast.ai**. `run.sh` 3.1.1 chỉ là loader nhỏ: tải manifest và sáu module, kiểm tra từng file rồi mới nạp logic triển khai. Stack không cài Docker Engine, không khởi động `dockerd`, không dùng Docker Compose, không tạo nested container, bridge network hay `socat`.
+KiQuai triển khai toàn bộ stack trực tiếp trong **một CUDA container gốc của Vast.ai**. `run.sh` 3.1.2 chỉ là loader nhỏ: tải manifest và sáu module, kiểm tra từng file rồi mới nạp logic triển khai. Stack không cài Docker Engine, không khởi động `dockerd`, không dùng Docker Compose, không tạo nested container, bridge network hay `socat`.
 
 Các process MySQL, Apache/PHP, Nginx và Hashtopolis Python Agent được quản lý bởi một `supervisord` riêng. Hashcat chạy trực tiếp trong cùng container để sử dụng GPU NVIDIA do Vast.ai gắn vào container đó.
 
@@ -38,7 +38,7 @@ flowchart LR
     Run["run.sh loader"] --> Manifest["scripts/manifest.sha256"]
     Manifest --> Download["Tải 6 module"]
     Download --> Verify["Release/API + SHA-256 + bash -n"]
-    Verify --> Cache["APP_DIR/bootstrap/3.1.1"]
+    Verify --> Cache["APP_DIR/bootstrap/3.1.2"]
     Cache --> Source["Source theo thứ tự"]
     Source --> Deploy["main → 10 deployment stages"]
 ```
@@ -68,7 +68,7 @@ TestHash/
 | `40-services.sh` | MySQL provisioning, HTTP health check và Python agent |
 | `50-cli.sh` | Diagnostics, command dispatch và 10 deployment stages |
 
-Loader không source một module nếu thiếu file, sai checksum, sai module API/release hoặc không qua `bash -n`. Module đã xác minh được cache tại `APP_DIR/bootstrap/3.1.1/` để source từ một đường dẫn ổn định và để file/line trong diagnostic còn tra cứu được.
+Loader không source một module nếu thiếu file, sai checksum, sai module API/release hoặc không qua `bash -n`. Module đã xác minh được cache tại `APP_DIR/bootstrap/3.1.2/` để source từ một đường dẫn ổn định và để file/line trong diagnostic còn tra cứu được.
 
 ## Trạng thái hỗ trợ upstream
 
@@ -83,7 +83,7 @@ Phiên bản mặc định:
 
 | Component | Phiên bản |
 |---|---|
-| Bootstrap/module release | `3.1.1` |
+| Bootstrap/module release | `3.1.2` |
 | Hashtopolis backend | `v1.0.0-rc2` |
 | Hashtopolis frontend | `v1.0.0-rc2` |
 | Python agent | Bản do backend cung cấp tại `agents.php?download=1` |
@@ -136,7 +136,7 @@ INTERNAL_PORT=18000 ./run.sh
 
 ## 2. Download và chạy
 
-> Phải push `run.sh`, `README.md`, `scripts/manifest.sha256` và cả sáu module trong **cùng một commit** trước khi dùng URL GitHub. Nhánh `main` phải thực sự chứa trọn release 3.1.1.
+> Phải push `run.sh`, `README.md`, `scripts/manifest.sha256` và cả sáu module trong **cùng một commit** trước khi dùng URL GitHub. Nhánh `main` phải thực sự chứa trọn release 3.1.2.
 
 Nếu image đã có `curl`, one-liner cho trường **On-start Script** là:
 
@@ -323,10 +323,10 @@ Hashtopolis có thể yêu cầu agent tải một Hashcat package riêng cho ta
 | `KIQUAI_REPOSITORY` | `kuronoFS/KiQuai` | Repository chứa `TestHash/` |
 | `KIQUAI_REF` | `refs/heads/main` | Branch, tag hoặc full commit SHA dùng cho manifest và module |
 | `KIQUAI_BASE_URL` | Raw GitHub URL suy ra từ repo/ref | Override nguồn tải; hỗ trợ HTTPS và `file://` để kiểm thử |
-| `KIQUAI_MODULE_DIR` | `APP_DIR/bootstrap/3.1.1` | Cache chỉ chứa module đã xác minh |
+| `KIQUAI_MODULE_DIR` | `APP_DIR/bootstrap/3.1.2` | Cache chỉ chứa module đã xác minh |
 | `KIQUAI_LOADER_LOG` | `LOG_DIR/loader.log` | Log tải, checksum, syntax check và source module |
 
-Loader yêu cầu `run.sh`, manifest và module có cùng release `3.1.1` và module API `1`. Không trộn file từ hai commit hoặc tự sửa module mà quên cập nhật manifest.
+Loader yêu cầu `run.sh`, manifest và module có cùng release `3.1.2` và module API `1`. Không trộn file từ hai commit hoặc tự sửa module mà quên cập nhật manifest.
 
 ### Runtime và version
 
@@ -542,18 +542,41 @@ cd TestHash/scripts
 {
   printf '%s\n' '# KiQuai verified module manifest' \
     '# kiquai-module-api: 1' \
-    '# kiquai-release: 3.1.1'
+    '# kiquai-release: 3.1.2'
   sha256sum 00-core.sh 10-system.sh 20-releases.sh \
     30-config.sh 40-services.sh 50-cli.sh
 } > manifest.sha256
 for file in ./*.sh ../run.sh; do bash -n "$file"; done
 ```
 
+### Backend `BACKOFF` hoặc `spawn error` ở bước 08/10
+
+Supervisor dùng trạng thái `BACKOFF` khi process thoát trước `startsecs`; lỗi thật nằm trong log của process, không phải trong chuỗi `spawn error`. Ở release 3.1.1, `sqlx-cli` chỉ được cache tại `APP_DIR/tools/bin/sqlx`, nhưng `setup.php` của Hashtopolis `v1.0.0-rc2` gọi trực tiếp `/usr/bin/sqlx`. Vì file đó không tồn tại, launcher backend thoát trước khi Apache khởi động. Frontend Angular tĩnh vẫn có thể mở qua Nginx trong trạng thái này, nhưng API chưa hoạt động.
+
+Release 3.1.2 luôn publish binary đã kiểm tra tới `/usr/bin/sqlx`, kiểm tra quyền ghi lock directory trước migration và tự in `backend.log`/`apache-error.log` khi Supervisor không thể đưa backend lên `RUNNING`. Sau khi push trọn bộ 3.1.2, chỉ cần tải lại loader và chạy reconcile:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kuronoFS/KiQuai/refs/heads/main/TestHash/run.sh -o /root/run.sh
+chmod 700 /root/run.sh
+/root/run.sh
+```
+
+Không dùng `WIPE_DATA=1` hoặc `FORCE_REBUILD=1`. Nếu cần sửa ngay instance đang chạy trước khi cập nhật repository:
+
+```bash
+install -m 755 /opt/kiquai-hashtopolis/tools/bin/sqlx /usr/bin/sqlx
+supervisorctl -c /opt/kiquai-hashtopolis/config/supervisord.conf stop backend >/dev/null 2>&1 || true
+supervisorctl -c /opt/kiquai-hashtopolis/config/supervisord.conf start backend
+tail -n 220 /var/log/kiquai-hashtopolis/backend.log
+```
+
+Tham chiếu: [`setup.php` v1.0.0-rc2](https://github.com/hashtopolis/server/blob/v1.0.0-rc2/src/inc/startup/setup.php), [Dockerfile v1.0.0-rc2](https://github.com/hashtopolis/server/blob/v1.0.0-rc2/Dockerfile) và [Supervisor process states](https://supervisord.org/subprocess.html#process-states).
+
 ### Exit 7 tại `restart_web_services` ở bước 08/10
 
 Lỗi này thuộc release 3.1.0 và đã sửa trong 3.1.1. `supervisorctl restart backend` thực hiện `stop` rồi `start`; khi backend chưa ở trạng thái `RUNNING`, phần `stop` trả mã 7 (`not running`) dù lần `start` sau đó có thể thành công. Vì thế web UI có thể truy cập trong khi bootstrap vẫn báo thất bại.
 
-Release 3.1.1 đọc trạng thái từng process, stop có kiểm soát, start khi cần và đợi `backend`/`nginx` đạt `RUNNING`. Cập nhật trọn bộ loader/module/manifest rồi chạy lại bình thường:
+Logic này tiếp tục được giữ trong 3.1.2: script đọc trạng thái từng process, stop có kiểm soát, start khi cần và đợi `backend`/`nginx` đạt `RUNNING`. Cập nhật trọn bộ loader/module/manifest rồi chạy lại bình thường:
 
 ```bash
 /root/run.sh
@@ -563,13 +586,13 @@ Không dùng `WIPE_DATA=1` và không cần `FORCE_REBUILD=1`; database cùng re
 
 ### Cảnh báo Apache `Could not reliably determine the server's fully qualified domain name`
 
-Đây chỉ là warning của `apache2ctl configtest`, không phải nguyên nhân exit 7. Release 3.1.1 tạo global `ServerName 127.0.0.1` để loại bỏ cảnh báo này.
+Đây chỉ là warning của `apache2ctl configtest`, không phải nguyên nhân exit 7. Từ release 3.1.1, script tạo global `ServerName 127.0.0.1` để loại bỏ cảnh báo này.
 
 ### `link: unbound variable` ở bước 06/10
 
-Lỗi này thuộc bản monolith 3.0.0, được sửa trong 3.0.1 và bản sửa tiếp tục nằm trong module `20-releases.sh` của release 3.1.1. Hàm tạo symlink cũ từng khai báo `link` rồi tham chiếu `${link}` trong cùng một lệnh `local`; với `set -u`, Bash mở rộng tham số trước khi builtin `local` hoàn tất phép gán nên script dừng tại nhánh reuse backend.
+Lỗi này thuộc bản monolith 3.0.0, được sửa trong 3.0.1 và bản sửa tiếp tục nằm trong module `20-releases.sh` của release 3.1.2. Hàm tạo symlink cũ từng khai báo `link` rồi tham chiếu `${link}` trong cùng một lệnh `local`; với `set -u`, Bash mở rộng tham số trước khi builtin `local` hoàn tất phép gán nên script dừng tại nhánh reuse backend.
 
-Đảm bảo repository đã có trọn bộ 3.1.1, thay `/root/run.sh` bằng loader mới rồi chạy lại:
+Đảm bảo repository đã có trọn bộ 3.1.2, thay `/root/run.sh` bằng loader mới rồi chạy lại:
 
 ```bash
 chmod +x /root/run.sh
@@ -593,6 +616,8 @@ Lần đầu script cài Rust toolchain tối thiểu và compile `sqlx-cli` v�
 ```text
 APP_DIR/tools/bin/sqlx
 ```
+
+Đồng thời script copy binary này tới `/usr/bin/sqlx`, là đường dẫn mà `setup.php` của backend `v1.0.0-rc2` gọi trực tiếp.
 
 Rust cache được xóa sau build nếu `KEEP_BUILD_TOOLCHAINS=0`.
 
@@ -666,9 +691,9 @@ ldconfig -p | grep -i -E 'libcuda|libOpenCL'
 - [Hashtopolis web UI](https://github.com/hashtopolis/web-ui)
 - [Hashtopolis Python agent](https://github.com/hashtopolis/agent-python)
 - [Hashtopolis official documentation](https://docs.hashtopolis.org/)
-- [Hashtopolis backend Dockerfile](https://github.com/hashtopolis/server/blob/master/Dockerfile)
-- [Hashtopolis backend entrypoint](https://github.com/hashtopolis/server/blob/master/docker-entrypoint.sh)
-- [Hashtopolis v1.0.0-rc2 startup setup](https://github.com/hashtopolis/server/blob/v1.0.0-rc2/src/inc/startup/setup.php)
+- [Hashtopolis backend Dockerfile v1.0.0-rc2](https://github.com/hashtopolis/server/blob/v1.0.0-rc2/Dockerfile)
+- [Hashtopolis backend entrypoint v1.0.0-rc2](https://github.com/hashtopolis/server/blob/v1.0.0-rc2/docker-entrypoint.sh)
+- [Hashtopolis setup.php v1.0.0-rc2](https://github.com/hashtopolis/server/blob/v1.0.0-rc2/src/inc/startup/setup.php)
 - [Hashtopolis frontend Dockerfile](https://github.com/hashtopolis/web-ui/blob/master/Dockerfile)
 - [Vast.ai Docker environment](https://docs.vast.ai/guides/instances/docker-environment)
 - [Vast.ai networking and ports](https://docs.vast.ai/guides/instances/connect/networking)

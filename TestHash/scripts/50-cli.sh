@@ -2,7 +2,7 @@
 # shellcheck shell=bash
 # KiQuai module: cli
 # kiquai-module-api: 1
-# kiquai-release: 3.1.1
+# kiquai-release: 3.1.2
 
 if [[ "${KIQUAI_MODULE_CONTEXT:-0}" != "1" ]]; then
   printf 'This file is a KiQuai module; run ../run.sh instead.\n' >&2
@@ -59,7 +59,10 @@ collect_diagnostics() {
     mysql --version 2>&1 || true
     nginx -v 2>&1 || true
     apache2ctl -v 2>&1 || true
+    printf '\n===== SQLx binaries =====\n'
+    ls -l "${TOOLS_DIR}/bin/sqlx" /usr/bin/sqlx 2>&1 || true
     "${TOOLS_DIR}/bin/sqlx" --version 2>&1 || true
+    /usr/bin/sqlx --version 2>&1 || true
     printf '\n===== PHP modules =====\n'
     php -m 2>&1 || true
     printf '\n===== NVIDIA =====\n'
