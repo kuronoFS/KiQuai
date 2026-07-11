@@ -1,6 +1,6 @@
 # KiQuai Hashtopolis + Hashcat trên Vast.ai
 
-`run.sh` triển khai toàn bộ stack trực tiếp trong **một CUDA container gốc của Vast.ai**. Script không cài Docker Engine, không khởi động `dockerd`, không dùng Docker Compose, không tạo nested container, bridge network hay `socat`.
+KiQuai triển khai toàn bộ stack trực tiếp trong **một CUDA container gốc của Vast.ai**. `run.sh` 3.1.0 chỉ là loader nhỏ: tải manifest và sáu module, kiểm tra từng file rồi mới nạp logic triển khai. Stack không cài Docker Engine, không khởi động `dockerd`, không dùng Docker Compose, không tạo nested container, bridge network hay `socat`.
 
 Các process MySQL, Apache/PHP, Nginx và Hashtopolis Python Agent được quản lý bởi một `supervisord` riêng. Hashcat chạy trực tiếp trong cùng container để sử dụng GPU NVIDIA do Vast.ai gắn vào container đó.
 
@@ -31,6 +31,45 @@ Tất cả node trong sơ đồ đều là process hoặc file nằm trong cùng
 
 `supervisord` dùng socket riêng trong `APP_DIR/run/`; nó không thay thế supervisor hoặc entrypoint do image/Vast.ai cung cấp.
 
+### Kiến trúc bootstrap module
+
+```mermaid
+flowchart LR
+    Run["run.sh loader"] --> Manifest["scripts/manifest.sha256"]
+    Manifest --> Download["Tải 6 module"]
+    Download --> Verify["Release/API + SHA-256 + bash -n"]
+    Verify --> Cache["APP_DIR/bootstrap/3.1.0"]
+    Cache --> Source["Source theo thứ tự"]
+    Source --> Deploy["main → 10 deployment stages"]
+```
+
+Cấu trúc phải được commit cùng nhau trong `TestHash/`:
+
+```text
+TestHash/
+├── run.sh
+├── README.md
+└── scripts/
+    ├── manifest.sha256
+    ├── 00-core.sh
+    ├── 10-system.sh
+    ├── 20-releases.sh
+    ├── 30-config.sh
+    ├── 40-services.sh
+    └── 50-cli.sh
+```
+
+| Module | Trách nhiệm |
+|---|---|
+| `00-core.sh` | State, biến môi trường, validation, logging và error trap |
+| `10-system.sh` | Preflight, APT, GPU/Hashcat, layout, legacy DinD cleanup và `sqlx` |
+| `20-releases.sh` | Node.js, backend/frontend build và atomic symlink |
+| `30-config.sh` | MySQL, PHP, Apache, Nginx, launcher và supervisor config |
+| `40-services.sh` | MySQL provisioning, HTTP health check và Python agent |
+| `50-cli.sh` | Diagnostics, command dispatch và 10 deployment stages |
+
+Loader không source một module nếu thiếu file, sai checksum, sai module API/release hoặc không qua `bash -n`. Module đã xác minh được cache tại `APP_DIR/bootstrap/3.1.0/` để source từ một đường dẫn ổn định và để file/line trong diagnostic còn tra cứu được.
+
 ## Trạng thái hỗ trợ upstream
 
 Hashtopolis chính thức khuyến nghị Docker từ phiên bản 0.14.0. Hướng dẫn cài trực tiếp không Docker vẫn tồn tại nhưng được upstream ghi rõ là **không được hỗ trợ chính thức**:
@@ -44,6 +83,7 @@ Phiên bản mặc định:
 
 | Component | Phiên bản |
 |---|---|
+| Bootstrap/module release | `3.1.0` |
 | Hashtopolis backend | `v1.0.0-rc2` |
 | Hashtopolis frontend | `v1.0.0-rc2` |
 | Python agent | Bản do backend cung cấp tại `agents.php?download=1` |
@@ -96,12 +136,35 @@ INTERNAL_PORT=18000 ./run.sh
 
 ## 2. Download và chạy
 
-Download:
+> Phải push `run.sh`, `README.md`, `scripts/manifest.sha256` và cả sáu module trong **cùng một commit** trước khi dùng URL GitHub. Nhánh `main` phải thực sự chứa trọn release 3.1.0.
+
+Nếu image đã có `curl`, one-liner cho trường **On-start Script** là:
 
 ```bash
-apt-get update && apt-get install -y curl ca-certificates
-curl -fsSL https://raw.githubusercontent.com/kuronoFS/KiQuai/refs/heads/main/TestDiD/run.sh -o /root/run.sh
-chmod 700 /root/run.sh
+bash -lc 'curl -fsSL https://raw.githubusercontent.com/kuronoFS/KiQuai/refs/heads/main/TestHash/run.sh -o /root/run.sh && chmod 700 /root/run.sh && /root/run.sh'
+```
+
+Đây là bản rút gọn được khuyến nghị. `run.sh` tự tải và kiểm tra manifest cùng từng module; không cần đưa sáu lệnh `curl` vào one-liner.
+
+Nếu image tối giản chưa có `curl`/CA certificate, dùng bản portable:
+
+```bash
+bash -lc 'apt-get update && apt-get install -y curl ca-certificates && curl -fsSL https://raw.githubusercontent.com/kuronoFS/KiQuai/refs/heads/main/TestHash/run.sh -o /root/run.sh && chmod 700 /root/run.sh && /root/run.sh'
+```
+
+Không dùng `curl ... | bash` ở đây: lưu `/root/run.sh` giúp dùng lại cùng entrypoint cho `status`, `logs`, `diagnostics` và các lần reconcile.
+
+Kiểm tra riêng module mà chưa deploy:
+
+```bash
+/root/run.sh verify-modules
+```
+
+Kết quả thành công phải xác nhận đủ sáu module. Ví dụ:
+
+```text
+OK [module=20-releases.sh] Checksum, release metadata, and Bash syntax verified.
+OK [module=run.sh] All 6 modules are verified and loadable.
 ```
 
 Preflight:
@@ -125,19 +188,23 @@ Triển khai:
 /root/run.sh
 ```
 
-One-liner:
-
-```bash
-bash -lc "apt-get update && apt-get install -y curl ca-certificates && curl -fsSL https://raw.githubusercontent.com/kuronoFS/KiQuai/refs/heads/main/TestDiD/run.sh -o /root/run.sh && chmod 700 /root/run.sh && /root/run.sh"
-```
-
 Nên dành tối thiểu 15 GB trống cho lần build đầu. Script hard-fail ở ngưỡng `MIN_FREE_GB=10` theo mặc định.
 
-Nếu muốn các service tự khởi động lại khi Vast.ai restart container, đặt one-liner trên vào trường **On-start Script** của template SSH.
+Nếu muốn các service tự reconcile khi Vast.ai restart container, đặt one-liner rút gọn vào trường **On-start Script** của template SSH.
+
+### Cố định một revision
+
+`refs/heads/main` là mutable. Để mọi lần chạy dùng đúng cùng bộ file, đặt `KIQUAI_REF` thành full commit SHA và dùng SHA đó trong URL tải loader:
+
+```bash
+bash -lc 'REF=YOUR_FULL_COMMIT_SHA; curl -fsSL "https://raw.githubusercontent.com/kuronoFS/KiQuai/$REF/TestHash/run.sh" -o /root/run.sh && chmod 700 /root/run.sh && KIQUAI_REF="$REF" /root/run.sh'
+```
+
+Nếu pin revision qua Vast template, nên đặt thêm `-e KIQUAI_REF=YOUR_FULL_COMMIT_SHA` để các lệnh sau cũng dùng cùng revision. GitHub ghi rõ URL theo branch có thể đổi theo commit mới, còn URL chứa commit ID giữ nguyên nội dung.
 
 ## 3. Mười giai đoạn triển khai
 
-Script và README sử dụng cùng flow:
+Trước giai đoạn 01/10, loader tải và xác minh toàn bộ module. Sau đó flow triển khai vẫn gồm đúng mười giai đoạn:
 
 1. Kiểm tra root, dung lượng và GPU NVIDIA.
 2. Cài Apache, PHP, MySQL, Nginx, supervisor, Hashcat và build dependencies.
@@ -232,6 +299,18 @@ CLI options `--voucher` và `--url` được agent chính thức hỗ trợ; xem
 Hashtopolis có thể yêu cầu agent tải một Hashcat package riêng cho task. `hashcat -I` trong bootstrap là preflight GPU; nó không ép server phải chọn đúng package Hashcat hệ thống cho mọi task.
 
 ## 6. Biến môi trường
+
+### Module loader
+
+| Biến | Mặc định | Mục đích |
+|---|---|---|
+| `KIQUAI_REPOSITORY` | `kuronoFS/KiQuai` | Repository chứa `TestHash/` |
+| `KIQUAI_REF` | `refs/heads/main` | Branch, tag hoặc full commit SHA dùng cho manifest và module |
+| `KIQUAI_BASE_URL` | Raw GitHub URL suy ra từ repo/ref | Override nguồn tải; hỗ trợ HTTPS và `file://` để kiểm thử |
+| `KIQUAI_MODULE_DIR` | `APP_DIR/bootstrap/3.1.0` | Cache chỉ chứa module đã xác minh |
+| `KIQUAI_LOADER_LOG` | `LOG_DIR/loader.log` | Log tải, checksum, syntax check và source module |
+
+Loader yêu cầu `run.sh`, manifest và module có cùng release `3.1.0` và module API `1`. Không trộn file từ hai commit hoặc tự sửa module mà quên cập nhật manifest.
 
 ### Runtime và version
 
@@ -394,7 +473,8 @@ MySQL data trong inner Docker volume **không tương thích bằng cách copy t
 
 | File | Nội dung |
 |---|---|
-| `bootstrap.log` | Toàn bộ output của `run.sh` |
+| `loader.log` | Tải manifest/module, SHA-256, syntax check, source và output tiếp theo |
+| `bootstrap.log` | Runtime config và mười deployment stages sau khi module đã nạp |
 | `supervisord.log` | Process supervisor riêng |
 | `mysql.log` | MySQL server |
 | `backend.log` | Migration/setup và Apache launcher |
@@ -411,6 +491,54 @@ Mặc định:
 ```
 
 ## 11. Troubleshooting
+
+### Loader báo module lỗi
+
+Chạy riêng verification:
+
+```bash
+/root/run.sh verify-modules
+tail -n 250 /var/log/kiquai-hashtopolis/loader.log
+```
+
+Ý nghĩa lỗi:
+
+| Thông báo | Nguyên nhân thường gặp |
+|---|---|
+| HTTP 404 khi tải manifest/module | Chưa push đủ cấu trúc `TestHash/scripts/` hoặc sai `KIQUAI_REF` |
+| `Manifest release/module API does not match` | `run.sh` và module đến từ hai release/commit khác nhau |
+| `SHA-256 mismatch` | Module đã thay đổi nhưng `manifest.sha256` chưa cập nhật, hoặc download bị thay đổi |
+| `Bash syntax validation failed` | Module có lỗi parser; loader chưa source hay chạy nó |
+| `Required function ... was not defined` | Module hợp lệ về cú pháp nhưng thiếu API function bắt buộc |
+
+Lỗi loader in `Module`, `Source`, `Line`, `Function` và `Command`. Lỗi runtime cũng in cùng các trường trong `bootstrap.log` và diagnostic report. Bash cung cấp `BASH_SOURCE`, `BASH_LINENO` và `FUNCNAME` để ánh xạ call stack về đúng file/hàm.
+
+Khi chủ động sửa module, tạo lại manifest trước khi commit:
+
+```bash
+cd TestHash/scripts
+{
+  printf '%s\n' '# KiQuai verified module manifest' \
+    '# kiquai-module-api: 1' \
+    '# kiquai-release: 3.1.0'
+  sha256sum 00-core.sh 10-system.sh 20-releases.sh \
+    30-config.sh 40-services.sh 50-cli.sh
+} > manifest.sha256
+for file in ./*.sh ../run.sh; do bash -n "$file"; done
+```
+
+### `link: unbound variable` ở bước 06/10
+
+Lỗi này thuộc bản monolith 3.0.0, được sửa trong 3.0.1 và bản sửa tiếp tục nằm trong module `20-releases.sh` của release 3.1.0. Hàm tạo symlink cũ từng khai báo `link` rồi tham chiếu `${link}` trong cùng một lệnh `local`; với `set -u`, Bash mở rộng tham số trước khi builtin `local` hoàn tất phép gán nên script dừng tại nhánh reuse backend.
+
+Đảm bảo repository đã có trọn bộ 3.1.0, thay `/root/run.sh` bằng loader mới rồi chạy lại:
+
+```bash
+chmod +x /root/run.sh
+/root/run.sh
+```
+
+Không cần xóa `APP_DIR` hay build lại backend. Release đã có marker `.kiquai-ready` sẽ được tái sử dụng và script tiếp tục build frontend. Nếu muốn ép build lại cả hai release, dùng `FORCE_REBUILD=1 /root/run.sh`.
 
 ### Port đã bị chiếm
 
@@ -489,6 +617,8 @@ ldconfig -p | grep -i -E 'libcuda|libOpenCL'
 - MySQL và Apache chỉ bind loopback.
 - `.env`, agent `config.json`, database backup và hashlist là dữ liệu nhạy cảm.
 - Không đặt credential trong public Vast.ai template.
+- SHA-256 manifest phát hiện file module không đồng bộ hoặc bị thay đổi sau khi manifest được tạo; nó không thay thế chữ ký phát hành vì manifest và module cùng nằm trong một repository.
+- Với môi trường cần tái lập chính xác, pin `KIQUAI_REF` bằng full commit SHA thay vì theo `main`.
 - Đổi admin password sau lần đăng nhập đầu.
 - `v1.0.0-rc2` là pre-release; backup trước khi đổi tag hoặc chạy migration.
 
@@ -503,4 +633,6 @@ ldconfig -p | grep -i -E 'libcuda|libOpenCL'
 - [Hashtopolis frontend Dockerfile](https://github.com/hashtopolis/web-ui/blob/master/Dockerfile)
 - [Vast.ai Docker environment](https://docs.vast.ai/guides/instances/docker-environment)
 - [Vast.ai networking and ports](https://docs.vast.ai/guides/instances/connect/networking)
+- [GNU Bash variables: BASH_SOURCE, BASH_LINENO và FUNCNAME](https://www.gnu.org/software/bash/manual/html_node/Bash-Variables.html)
+- [GitHub permanent links to files](https://docs.github.com/en/repositories/working-with-files/using-files/getting-permanent-links-to-files)
 - [Hashcat official site](https://hashcat.net/hashcat/)
