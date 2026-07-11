@@ -2,7 +2,7 @@
 # shellcheck shell=bash
 # KiQuai module: releases
 # kiquai-module-api: 1
-# kiquai-release: 3.1.2
+# kiquai-release: 3.2.0
 
 if [[ "${KIQUAI_MODULE_CONTEXT:-0}" != "1" ]]; then
   printf 'This file is a KiQuai module; run ../run.sh instead.\n' >&2
@@ -41,23 +41,43 @@ atomic_symlink() {
   local link="$2"
   local temp="${link}.tmp.$$"
 
-  rm -f -- "${temp}"
-  ln -s -- "${target}" "${temp}"
-  mv -Tf "${temp}" "${link}"
+  rm -f -- "${temp}" || return 1
+  if ! ln -s -- "${target}" "${temp}"; then
+    rm -f -- "${temp}" 2>/dev/null || true
+    return 1
+  fi
+  if ! mv -Tf "${temp}" "${link}"; then
+    rm -f -- "${temp}" 2>/dev/null || true
+    return 1
+  fi
+}
+
+harden_server_release_permissions() {
+  local target="$1"
+  [[ -d "${target}/src/inc/utils/locks" ]] \
+    || die "Backend lock directory is missing: ${target}/src/inc/utils/locks."
+  chown -R root:www-data "${target}"
+  chmod -R u=rwX,g=rX,o= "${target}"
+  chown -R www-data:www-data "${target}/src/inc/utils/locks"
+  chmod 770 "${target}/src/inc/utils/locks"
 }
 
 build_server_release() {
   local suffix="${HASHTOPOLIS_VERSION#v}"
   local target="${RELEASES_DIR}/server-${suffix}"
   if [[ -f "${target}/.kiquai-ready" && "${FORCE_REBUILD}" == "0" ]]; then
+    SERVER_RELEASE_TARGET="${target}"
+    harden_server_release_permissions "${target}"
     info "Reusing Hashtopolis backend ${HASHTOPOLIS_VERSION}."
-    atomic_symlink "${target}" "${SERVER_CURRENT}"
     return 0
   fi
+  if [[ -e "${target}" ]]; then
+    target="${target}-rebuild-${RUN_ID}"
+  fi
+  SERVER_RELEASE_TARGET="${target}"
 
   local temp="${RELEASES_DIR}/.server-${suffix}.tmp.$$"
-  local backup="${RELEASES_DIR}/.server-${suffix}.old.$$"
-  rm -rf -- "${temp}" "${backup}"
+  rm -rf -- "${temp}"
   retry 3 5 git clone --depth 1 --branch "${HASHTOPOLIS_VERSION}" \
     "${HASHTOPOLIS_SERVER_REPOSITORY}" "${temp}"
   COMPOSER_ALLOW_SUPERUSER=1 composer install \
@@ -66,27 +86,25 @@ build_server_release() {
   [[ -f "${temp}/src/inc/startup/setup.php" ]] \
     || die "The backend source tree is incomplete."
   printf '%s\n' "${HASHTOPOLIS_VERSION}" > "${temp}/.kiquai-ready"
-  chown -R www-data:www-data "${temp}"
-  if [[ -e "${target}" ]]; then
-    mv "${target}" "${backup}"
-  fi
+  harden_server_release_permissions "${temp}"
   mv "${temp}" "${target}"
-  atomic_symlink "${target}" "${SERVER_CURRENT}"
-  rm -rf -- "${backup}"
 }
 
 build_frontend_release() {
   local suffix="${HASHTOPOLIS_FRONTEND_VERSION#v}"
   local target="${RELEASES_DIR}/frontend-${suffix}"
   if [[ -f "${target}/.kiquai-ready" && "${FORCE_REBUILD}" == "0" ]]; then
+    FRONTEND_RELEASE_TARGET="${target}"
     info "Reusing Hashtopolis frontend ${HASHTOPOLIS_FRONTEND_VERSION}."
-    atomic_symlink "${target}" "${FRONTEND_CURRENT}"
     return 0
   fi
+  if [[ -e "${target}" ]]; then
+    target="${target}-rebuild-${RUN_ID}"
+  fi
+  FRONTEND_RELEASE_TARGET="${target}"
 
   local temp="${RELEASES_DIR}/.frontend-${suffix}.tmp.$$"
-  local backup="${RELEASES_DIR}/.frontend-${suffix}.old.$$"
-  rm -rf -- "${temp}" "${backup}"
+  rm -rf -- "${temp}"
   retry 3 5 git clone --depth 1 --branch "${HASHTOPOLIS_FRONTEND_VERSION}" \
     "${HASHTOPOLIS_FRONTEND_REPOSITORY}" "${temp}"
   [[ -r "${temp}/.nvmrc" ]] || die "The frontend release does not contain .nvmrc."
@@ -94,7 +112,7 @@ build_frontend_release() {
   node_version="$(tr -d '[:space:]' < "${temp}/.nvmrc")"
   install_node_version "${node_version}"
   (
-    cd "${temp}"
+    cd "${temp}" || exit 1
     export PUPPETEER_SKIP_DOWNLOAD=true
     retry 2 10 npm ci
     npm run build
@@ -106,10 +124,31 @@ build_frontend_release() {
   printf '%s\n' "${HASHTOPOLIS_FRONTEND_VERSION}" > "${temp}/.kiquai-ready"
   chown -R root:www-data "${temp}"
   chmod -R g+rX "${temp}"
-  if [[ -e "${target}" ]]; then
-    mv "${target}" "${backup}"
-  fi
   mv "${temp}" "${target}"
-  atomic_symlink "${target}" "${FRONTEND_CURRENT}"
-  rm -rf -- "${backup}"
+}
+
+activate_releases() {
+  local previous_server=""
+  local previous_frontend=""
+  [[ -f "${SERVER_RELEASE_TARGET}/.kiquai-ready" ]] \
+    || die "The staged backend release is not ready: ${SERVER_RELEASE_TARGET:-unset}."
+  [[ -f "${FRONTEND_RELEASE_TARGET}/.kiquai-ready" ]] \
+    || die "The staged frontend release is not ready: ${FRONTEND_RELEASE_TARGET:-unset}."
+
+  previous_server="$(readlink -f "${SERVER_CURRENT}" 2>/dev/null || true)"
+  previous_frontend="$(readlink -f "${FRONTEND_CURRENT}" 2>/dev/null || true)"
+  atomic_symlink "${SERVER_RELEASE_TARGET}" "${SERVER_CURRENT}" \
+    || die "Unable to activate the staged backend release."
+  if ! atomic_symlink "${FRONTEND_RELEASE_TARGET}" "${FRONTEND_CURRENT}"; then
+    if [[ -n "${previous_server}" ]]; then
+      atomic_symlink "${previous_server}" "${SERVER_CURRENT}" || true
+    else
+      rm -f "${SERVER_CURRENT}"
+    fi
+    if [[ -n "${previous_frontend}" ]]; then
+      atomic_symlink "${previous_frontend}" "${FRONTEND_CURRENT}" || true
+    fi
+    die "Unable to activate the staged frontend release; backend pointer was rolled back."
+  fi
+  success "Activated backend ${HASHTOPOLIS_VERSION} and frontend ${HASHTOPOLIS_FRONTEND_VERSION}."
 }

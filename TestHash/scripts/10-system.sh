@@ -2,7 +2,7 @@
 # shellcheck shell=bash
 # KiQuai module: system
 # kiquai-module-api: 1
-# kiquai-release: 3.1.2
+# kiquai-release: 3.2.0
 
 if [[ "${KIQUAI_MODULE_CONTEXT:-0}" != "1" ]]; then
   printf 'This file is a KiQuai module; run ../run.sh instead.\n' >&2
@@ -10,6 +10,7 @@ if [[ "${KIQUAI_MODULE_CONTEXT:-0}" != "1" ]]; then
 fi
 
 acquire_lock() {
+  have_cmd flock || die "Required command 'flock' is missing; install util-linux first."
   mkdir -p "$(dirname "${LOCK_FILE}")"
   exec 9>"${LOCK_FILE}"
   flock -n 9 || die "Another KiQuai operation is already running."
@@ -34,9 +35,17 @@ check_free_space() {
 validate_outer_runtime() {
   [[ "$(uname -m)" == "x86_64" ]] \
     || die "This bootstrap currently supports x86_64 Vast.ai GPU instances only."
-  have_cmd nvidia-smi || die "nvidia-smi is unavailable. Use an NVIDIA/CUDA Vast.ai image."
-  nvidia-smi -L || die "The NVIDIA GPU is not exposed to the outer container."
-  nvidia-smi --query-gpu=index,name,driver_version,memory.total --format=csv,noheader
+  if ! have_cmd nvidia-smi; then
+    [[ "${REQUIRE_HASHCAT_GPU}" == "0" ]] \
+      || die "nvidia-smi is unavailable. Use an NVIDIA/CUDA Vast.ai image."
+    warn "nvidia-smi is unavailable; continuing in explicit server-only mode."
+  elif ! nvidia-smi -L; then
+    [[ "${REQUIRE_HASHCAT_GPU}" == "0" ]] \
+      || die "The NVIDIA GPU is not exposed to the outer container."
+    warn "No NVIDIA GPU is exposed; continuing in explicit server-only mode."
+  else
+    nvidia-smi --query-gpu=index,name,driver_version,memory.total --format=csv,noheader
+  fi
   check_free_space
   success "Outer-container preflight passed; no privileged DinD capabilities are required."
 }
@@ -52,7 +61,7 @@ create_policy_rcd() {
 install_packages() {
   if [[ "${SKIP_APT}" == "1" ]]; then
     local command
-    for command in apache2ctl composer curl envsubst git hashcat jq mysql mysqladmin mysqld nginx openssl php python3 sha256sum supervisorctl supervisord xz; do
+    for command in apache2ctl awk composer curl df envsubst find flock git hashcat install jq mysql mysqladmin mysqld nginx openssl pgrep php python3 readlink realpath runuser sed seq sha256sum ss stat supervisorctl supervisord tar tee tr xz; do
       have_cmd "${command}" || die "SKIP_APT=1 but '${command}' is missing."
     done
     return 0
@@ -186,11 +195,17 @@ supervisor_ctl() {
 
 stop_managed_services() {
   if supervisor_is_running; then
+    info "Stopping KiQuai Supervisor and all managed processes."
     supervisor_ctl shutdown >/dev/null 2>&1 || true
-    local deadline=$((SECONDS + 30))
+    local deadline=$((SECONDS + 90))
     while supervisor_is_running && (( SECONDS < deadline )); do
       sleep 1
     done
+    if supervisor_is_running; then
+      supervisor_ctl status 2>&1 || true
+      tail -n 120 "${LOG_DIR}/supervisord.log" 2>/dev/null || true
+      die "KiQuai supervisord did not stop within 90 seconds; data was left untouched."
+    fi
   fi
   rm -f "${SUPERVISOR_SOCKET}" "${SUPERVISOR_PID}" 2>/dev/null || true
 }
@@ -257,36 +272,48 @@ validate_service_ports() {
   done
 }
 
+sqlx_version_matches() {
+  local binary="$1"
+  [[ -x "${binary}" ]] || return 1
+  [[ "$("${binary}" --version 2>/dev/null || true)" == "sqlx-cli ${SQLX_CLI_VERSION}" ]]
+}
+
 publish_sqlx_runtime_binary() {
   local cached_binary="${TOOLS_DIR}/bin/sqlx"
-  [[ -x "${cached_binary}" ]] \
-    || die "The cached SQLx binary is missing: ${cached_binary}."
+  sqlx_version_matches "${cached_binary}" \
+    || die "The cached SQLx binary is missing or is not sqlx-cli ${SQLX_CLI_VERSION}: ${cached_binary}."
 
   # Hashtopolis v1.0.0-rc2 setup.php invokes /usr/bin/sqlx explicitly. This
   # mirrors the COPY --from=prebuild ... /usr/bin/ step in its Dockerfile.
   install -m 755 "${cached_binary}" /usr/bin/sqlx
+  sqlx_version_matches /usr/bin/sqlx \
+    || die "Published /usr/bin/sqlx failed its exact version check."
   /usr/bin/sqlx --version
 }
 
 install_sqlx() {
-  if [[ -x "${TOOLS_DIR}/bin/sqlx" ]]; then
+  if sqlx_version_matches "${TOOLS_DIR}/bin/sqlx"; then
     publish_sqlx_runtime_binary
     return 0
   fi
-  if have_cmd sqlx; then
+  if [[ -e "${TOOLS_DIR}/bin/sqlx" ]]; then
+    warn "Replacing cached SQLx because version ${SQLX_CLI_VERSION} is required."
+    rm -f "${TOOLS_DIR}/bin/sqlx"
+  fi
+  if have_cmd sqlx && sqlx_version_matches "$(command -v sqlx)"; then
     install -m 755 "$(command -v sqlx)" "${TOOLS_DIR}/bin/sqlx"
     publish_sqlx_runtime_binary
     return 0
   fi
 
-  local build_root="${TOOLS_DIR}/sqlx-build"
+  local build_root="${TOOLS_DIR}/sqlx-build-${SQLX_CLI_VERSION}"
   local rustup_home="${build_root}/rustup"
   local cargo_home="${build_root}/cargo"
   local temp
   temp="$(mktemp -d)"
   local rustup_url="https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init"
 
-  info "Installing the sqlx migration CLI used by the official Hashtopolis backend."
+  info "Installing pinned sqlx-cli ${SQLX_CLI_VERSION} with Rust ${RUST_TOOLCHAIN_VERSION}."
   retry 4 5 curl -fsSL "${rustup_url}" -o "${temp}/rustup-init"
   retry 4 5 curl -fsSL "${rustup_url}.sha256" -o "${temp}/rustup-init.sha256"
   local expected
@@ -296,9 +323,11 @@ install_sqlx() {
   chmod 700 "${temp}/rustup-init"
 
   CARGO_HOME="${cargo_home}" RUSTUP_HOME="${rustup_home}" \
-    "${temp}/rustup-init" -y --no-modify-path --profile minimal --default-toolchain stable
+    "${temp}/rustup-init" -y --no-modify-path --profile minimal \
+      --default-toolchain "${RUST_TOOLCHAIN_VERSION}"
   CARGO_HOME="${cargo_home}" RUSTUP_HOME="${rustup_home}" \
-    retry 2 10 "${cargo_home}/bin/cargo" install --locked sqlx-cli \
+    retry 2 10 "${cargo_home}/bin/cargo" install --locked \
+      --version "${SQLX_CLI_VERSION}" sqlx-cli \
       --no-default-features --features native-tls,mysql --root "${TOOLS_DIR}"
   rm -rf "${temp}"
   publish_sqlx_runtime_binary

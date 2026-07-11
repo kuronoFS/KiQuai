@@ -1,6 +1,6 @@
 # KiQuai Hashtopolis + Hashcat trên Vast.ai
 
-KiQuai triển khai toàn bộ stack trực tiếp trong **một CUDA container gốc của Vast.ai**. `run.sh` 3.1.2 chỉ là loader nhỏ: tải manifest và sáu module, kiểm tra từng file rồi mới nạp logic triển khai. Stack không cài Docker Engine, không khởi động `dockerd`, không dùng Docker Compose, không tạo nested container, bridge network hay `socat`.
+KiQuai triển khai toàn bộ stack trực tiếp trong **một CUDA container gốc của Vast.ai**. `run.sh` 3.2.0 chỉ là loader nhỏ: tải manifest và sáu module, kiểm tra từng file rồi mới nạp logic triển khai. Stack không cài Docker Engine, không khởi động `dockerd`, không dùng Docker Compose, không tạo nested container, bridge network hay `socat`.
 
 Các process MySQL, Apache/PHP, Nginx và Hashtopolis Python Agent được quản lý bởi một `supervisord` riêng. Hashcat chạy trực tiếp trong cùng container để sử dụng GPU NVIDIA do Vast.ai gắn vào container đó.
 
@@ -38,7 +38,8 @@ flowchart LR
     Run["run.sh loader"] --> Manifest["scripts/manifest.sha256"]
     Manifest --> Download["Tải 6 module"]
     Download --> Verify["Release/API + SHA-256 + bash -n"]
-    Verify --> Cache["APP_DIR/bootstrap/3.1.2"]
+    Verify --> Cache["Atomic cache APP_DIR/bootstrap/3.2.0"]
+    Offline["Mạng lỗi / lệnh cứu hộ"] --> Cache
     Cache --> Source["Source theo thứ tự"]
     Source --> Deploy["main → 10 deployment stages"]
 ```
@@ -49,6 +50,8 @@ Cấu trúc phải được commit cùng nhau trong `TestHash/`:
 TestHash/
 ├── run.sh
 ├── README.md
+├── tests/
+│   └── test-shell.sh
 └── scripts/
     ├── manifest.sha256
     ├── 00-core.sh
@@ -63,12 +66,12 @@ TestHash/
 |---|---|
 | `00-core.sh` | State, biến môi trường, validation, logging và error trap |
 | `10-system.sh` | Preflight, APT, GPU/Hashcat, layout, legacy DinD cleanup và `sqlx` |
-| `20-releases.sh` | Node.js, backend/frontend build và atomic symlink |
-| `30-config.sh` | MySQL, PHP, Apache, Nginx, launcher và supervisor config |
-| `40-services.sh` | MySQL provisioning, HTTP health check và Python agent |
+| `20-releases.sh` | Node.js, immutable backend/frontend build và controlled activation |
+| `30-config.sh` | MySQL, PHP, Apache, Nginx, runtime launcher và supervisor config |
+| `40-services.sh` | MySQL provisioning, one-shot migration, HTTP contract check và Python agent |
 | `50-cli.sh` | Diagnostics, command dispatch và 10 deployment stages |
 
-Loader không source một module nếu thiếu file, sai checksum, sai module API/release hoặc không qua `bash -n`. Module đã xác minh được cache tại `APP_DIR/bootstrap/3.1.2/` để source từ một đường dẫn ổn định và để file/line trong diagnostic còn tra cứu được.
+Loader không source một module nếu thiếu file, sai checksum, sai module API/release hoặc không qua `bash -n`. Module đã xác minh được publish nguyên thư mục dưới lock tại `APP_DIR/bootstrap/3.2.0/`. Các lệnh vận hành như `status`, `logs`, `diagnostics`, `stop` và `help` ưu tiên cache đã xác minh nên vẫn dùng được khi GitHub tạm thời mất kết nối.
 
 ## Trạng thái hỗ trợ upstream
 
@@ -83,7 +86,7 @@ Phiên bản mặc định:
 
 | Component | Phiên bản |
 |---|---|
-| Bootstrap/module release | `3.1.2` |
+| Bootstrap/module release | `3.2.0` |
 | Hashtopolis backend | `v1.0.0-rc2` |
 | Hashtopolis frontend | `v1.0.0-rc2` |
 | Python agent | Bản do backend cung cấp tại `agents.php?download=1` |
@@ -136,7 +139,7 @@ INTERNAL_PORT=18000 ./run.sh
 
 ## 2. Download và chạy
 
-> Phải push `run.sh`, `README.md`, `scripts/manifest.sha256` và cả sáu module trong **cùng một commit** trước khi dùng URL GitHub. Nhánh `main` phải thực sự chứa trọn release 3.1.2.
+> Phải push `run.sh`, `README.md`, `scripts/manifest.sha256` và cả sáu module trong **cùng một commit** trước khi dùng URL GitHub. Nhánh `main` phải thực sự chứa trọn release 3.2.0.
 
 Nếu image đã có `curl`, one-liner cho trường **On-start Script** là:
 
@@ -166,6 +169,14 @@ Kết quả thành công phải xác nhận đủ sáu module. Ví dụ:
 OK [module=20-releases.sh] Checksum, release metadata, and Bash syntax verified.
 OK [module=run.sh] All 6 modules are verified and loadable.
 ```
+
+Regression test không cần GPU/MySQL/service thật:
+
+```bash
+bash tests/test-shell.sh
+```
+
+Test kiểm tra `bash -n`, manifest SHA-256, source module dưới `set -u`, generated launcher, Supervisor autostart policy, re-derive `PUBLIC_URL`, failed-migration guard, HTTP contract, thứ tự deploy và cache loader khi offline.
 
 Preflight:
 
@@ -211,13 +222,13 @@ Trước giai đoạn 01/10, loader tải và xác minh toàn bộ module. Sau �
 3. Tạo layout persistent, tiếp nhận credential cũ nếu có và lưu cấu hình.
 4. Chạy `hashcat -I` để xác nhận compute device.
 5. Cài `sqlx` migration CLI giống backend image chính thức.
-6. Checkout và build backend/frontend ở hai tag tương thích.
-7. Sinh cấu hình MySQL, Apache, Nginx, supervisor và initialize MySQL khi cần.
-8. Khởi động process, tạo database/user và chạy migration/setup của Hashtopolis.
-9. Kiểm tra frontend/API rồi cài Python agent.
+6. Checkout và build backend/frontend bất biến ở hai tag tương thích; chưa đổi release đang phục vụ.
+7. Dừng agent/Nginx/backend, kích hoạt đồng bộ cặp release, sinh và kiểm tra cấu hình, rồi initialize MySQL khi cần.
+8. Chỉ khởi động MySQL, tạo database/user, chặn migration dở, chạy `setup.php` đồng bộ đúng một lần, sau đó mới start backend/Nginx.
+9. Kiểm tra frontend và JSON contract của legacy agent API rồi cài Python agent.
 10. In trạng thái và credential.
 
-Lần đầu có thể mất nhiều thời gian ở bước build `sqlx` và Angular frontend. Các lần chạy sau tái sử dụng tool và release đã build.
+Lần đầu có thể mất nhiều thời gian ở bước build `sqlx` và Angular frontend. `sqlx-cli` được pin ở `0.9.0` và Rust ở `1.94.0`; các lần chạy sau chỉ tái sử dụng binary khi exact version khớp.
 
 ## 4. Kết quả
 
@@ -323,10 +334,14 @@ Hashtopolis có thể yêu cầu agent tải một Hashcat package riêng cho ta
 | `KIQUAI_REPOSITORY` | `kuronoFS/KiQuai` | Repository chứa `TestHash/` |
 | `KIQUAI_REF` | `refs/heads/main` | Branch, tag hoặc full commit SHA dùng cho manifest và module |
 | `KIQUAI_BASE_URL` | Raw GitHub URL suy ra từ repo/ref | Override nguồn tải; hỗ trợ HTTPS và `file://` để kiểm thử |
-| `KIQUAI_MODULE_DIR` | `APP_DIR/bootstrap/3.1.2` | Cache chỉ chứa module đã xác minh |
+| `KIQUAI_MODULE_DIR` | `APP_DIR/bootstrap/3.2.0` | Cache chỉ chứa module đã xác minh |
 | `KIQUAI_LOADER_LOG` | `LOG_DIR/loader.log` | Log tải, checksum, syntax check và source module |
+| `KIQUAI_REFRESH_MODULES` | `0` | Đặt `1` để buộc lệnh vận hành thử refresh module thay vì ưu tiên cache |
+| `KIQUAI_REQUIRE_FRESH_MODULES` | `0` | Đặt `1` để cấm fallback cache nếu tải mạng thất bại |
 
-Loader yêu cầu `run.sh`, manifest và module có cùng release `3.1.2` và module API `1`. Không trộn file từ hai commit hoặc tự sửa module mà quên cập nhật manifest.
+Loader yêu cầu `run.sh`, manifest và module có cùng release `3.2.0` và module API `1`. Không trộn file từ hai commit hoặc tự sửa module mà quên cập nhật manifest.
+
+`deploy`/`restart` thử tải bộ module mới trước rồi fallback sang cache đã xác minh nếu lỗi mạng. `verify-modules` luôn yêu cầu tải thành công; các lệnh cứu hộ ưu tiên cache để không bị GitHub chặn việc debug hoặc stop service.
 
 ### Runtime và version
 
@@ -365,6 +380,8 @@ APP_DIR=/data/kiquai-hashtopolis /root/run.sh logs
 | `HASHTOPOLIS_FRONTEND_PORT` | Port được suy ra từ `PUBLIC_URL` |
 
 Giá trị caller truyền trực tiếp có ưu tiên cao nhất; nếu không truyền, script tái sử dụng giá trị trong `.env`; nếu chưa có thì mới sinh mặc định.
+
+Riêng khi caller truyền `PUBLIC_URL` mới, script tự tính lại `HASHTOPOLIS_BACKEND_URL` và `HASHTOPOLIS_FRONTEND_PORT` nếu caller không override trực tiếp hai biến phụ này. Vì vậy frontend không còn giữ origin cũ từ `.env`.
 
 ### Agent và vận hành
 
@@ -409,6 +426,8 @@ Status:
 ```bash
 /root/run.sh status
 ```
+
+`status` chỉ trả exit `0` khi Supervisor programs bắt buộc, database login, GPU/Hashcat, frontend và JSON contract `testConnection` của agent API đều đạt. HTTP `404`/body sai hoặc migration `success=0` trả exit khác `0`, phù hợp cho automation.
 
 Log:
 
@@ -499,12 +518,15 @@ MySQL data trong inner Docker volume **không tương thích bằng cách copy t
 | `bootstrap.log` | Runtime config và mười deployment stages sau khi module đã nạp |
 | `supervisord.log` | Process supervisor riêng |
 | `mysql.log` | MySQL server |
-| `backend.log` | Migration/setup và Apache launcher |
+| `migration.log` | `setup.php`/SQLx one-shot, có timestamp và `run_id` từng dòng |
+| `backend.log` | Backend start gate và Apache launcher; không chạy migration |
 | `apache-error.log` | PHP/Apache errors |
 | `nginx-error.log` | Nginx errors |
 | `agent.log` | Python agent và Hashcat task output |
 | `hashcat-devices.log` | Kết quả `hashcat -I` |
 | `diagnostics/` | Snapshot chẩn đoán đã redact secret |
+
+Mỗi lần gọi loader/runtime có `run_id` xuyên suốt `loader.log`, `bootstrap.log`, `migration.log` và launcher. `diagnostics` còn ghi trạng thái `_sqlx_migrations`, phiên bản SQLx và bounded tail của các log dịch vụ để phân biệt lỗi lịch sử với lỗi của lần chạy hiện tại.
 
 Mặc định:
 
@@ -542,47 +564,49 @@ cd TestHash/scripts
 {
   printf '%s\n' '# KiQuai verified module manifest' \
     '# kiquai-module-api: 1' \
-    '# kiquai-release: 3.1.2'
+    '# kiquai-release: 3.2.0'
   sha256sum 00-core.sh 10-system.sh 20-releases.sh \
     30-config.sh 40-services.sh 50-cli.sh
 } > manifest.sha256
 for file in ./*.sh ../run.sh; do bash -n "$file"; done
 ```
 
-### Backend `BACKOFF` hoặc `spawn error` ở bước 08/10
+### `migration ... is partially applied`
 
-Supervisor dùng trạng thái `BACKOFF` khi process thoát trước `startsecs`; lỗi thật nằm trong log của process, không phải trong chuỗi `spawn error`. Ở release 3.1.1, `sqlx-cli` chỉ được cache tại `APP_DIR/tools/bin/sqlx`, nhưng `setup.php` của Hashtopolis `v1.0.0-rc2` gọi trực tiếp `/usr/bin/sqlx`. Vì file đó không tồn tại, launcher backend thoát trước khi Apache khởi động. Frontend Angular tĩnh vẫn có thể mở qua Nginx trong trạng thái này, nhưng API chưa hoạt động.
+Đây là trạng thái database, không còn là lỗi thiếu binary. Log có thể chứa các dòng `/usr/bin/sqlx: not found` cũ vì log Supervisor được append; hãy xem `migration.log` và `run_id` mới nhất trước.
 
-Release 3.1.2 luôn publish binary đã kiểm tra tới `/usr/bin/sqlx`, kiểm tra quyền ghi lock directory trước migration và tự in `backend.log`/`apache-error.log` khi Supervisor không thể đưa backend lên `RUNNING`. Sau khi push trọn bộ 3.1.2, chỉ cần tải lại loader và chạy reconcile:
+Release 3.1.2 từng để Supervisor tự start backend, trong khi backend launcher chạy `setup.php`. Sau khi provision database, chính flow deploy lại stop backend đang `STARTING`; nếu SQLx đang chạy, SIGTERM có thể để `_sqlx_migrations.success=0`. Release 3.2.0 loại bỏ race này: migration chạy đồng bộ ngoài Supervisor, backend/Nginx chỉ start sau khi setup thành công, và backend autorestart không bao giờ chạy migration lại.
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/kuronoFS/KiQuai/refs/heads/main/TestHash/run.sh -o /root/run.sh
-chmod 700 /root/run.sh
-/root/run.sh
-```
+Khi nâng cấp lần đầu, nếu launcher 3.1.x cũ vẫn đang chạy `setup.php`/`sqlx`, 3.2.0 chờ tối đa 900 giây thay vì gửi SIGTERM. Quá thời gian, cutover dừng fail-closed và giữ nguyên process để operator kiểm tra.
 
-Không dùng `WIPE_DATA=1` hoặc `FORCE_REBUILD=1`. Nếu cần sửa ngay instance đang chạy trước khi cập nhật repository:
+3.2.0 phát hiện row `success=0` trước khi đụng schema, in chính xác version/description/time rồi dừng với backend và Nginx ở trạng thái stopped. Script **không tự xóa row** vì MySQL DDL có thể đã commit một phần.
+
+Kiểm tra:
 
 ```bash
-install -m 755 /opt/kiquai-hashtopolis/tools/bin/sqlx /usr/bin/sqlx
-supervisorctl -c /opt/kiquai-hashtopolis/config/supervisord.conf stop backend >/dev/null 2>&1 || true
-supervisorctl -c /opt/kiquai-hashtopolis/config/supervisord.conf start backend
-tail -n 220 /var/log/kiquai-hashtopolis/backend.log
+set -a
+source /opt/kiquai-hashtopolis/.env
+set +a
+MYSQL_PWD="$MYSQL_PASSWORD" mysql \
+  -h 127.0.0.1 -P "$DB_PORT" -u "$MYSQL_USER" "$MYSQL_DATABASE" \
+  -e 'SELECT version,description,installed_on,success FROM _sqlx_migrations ORDER BY version;'
+tail -n 240 /var/log/kiquai-hashtopolis/migration.log
+/root/run.sh diagnostics
 ```
 
-Tham chiếu: [`setup.php` v1.0.0-rc2](https://github.com/hashtopolis/server/blob/v1.0.0-rc2/src/inc/startup/setup.php), [Dockerfile v1.0.0-rc2](https://github.com/hashtopolis/server/blob/v1.0.0-rc2/Dockerfile) và [Supervisor process states](https://supervisord.org/subprocess.html#process-states).
-
-### Exit 7 tại `restart_web_services` ở bước 08/10
-
-Lỗi này thuộc release 3.1.0 và đã sửa trong 3.1.1. `supervisorctl restart backend` thực hiện `stop` rồi `start`; khi backend chưa ở trạng thái `RUNNING`, phần `stop` trả mã 7 (`not running`) dù lần `start` sau đó có thể thành công. Vì thế web UI có thể truy cập trong khi bootstrap vẫn báo thất bại.
-
-Logic này tiếp tục được giữ trong 3.1.2: script đọc trạng thái từng process, stop có kiểm soát, start khi cần và đợi `backend`/`nginx` đạt `RUNNING`. Cập nhật trọn bộ loader/module/manifest rồi chạy lại bình thường:
+Nếu instance chỉ là thử nghiệm và toàn bộ database/file/agent state có thể bỏ, cách sạch nhất là:
 
 ```bash
-/root/run.sh
+WIPE_DATA=1 /root/run.sh deploy
 ```
 
-Không dùng `WIPE_DATA=1` và không cần `FORCE_REBUILD=1`; database cùng release hiện có sẽ được tái sử dụng.
+Nếu dữ liệu có giá trị, không chạy lệnh trên và không chỉ `DELETE` row migration. Hãy dừng service, sao lưu data directory/database, đối chiếu migration SQL đúng tag với schema đã áp dụng dở, rồi restore backup hoặc repair có kiểm soát trước khi chạy lại. Migration `20251127000000_initial.sql` dài và chứa nhiều DDL/seed data nên rerun mù sau khi xóa metadata có thể tạo duplicate hoặc constraint lỗi.
+
+Tham chiếu: [`setup.php` v1.0.0-rc2](https://github.com/hashtopolis/server/blob/v1.0.0-rc2/src/inc/startup/setup.php), [`20251127000000_initial.sql`](https://github.com/hashtopolis/server/blob/v1.0.0-rc2/src/migrations/mysql/20251127000000_initial.sql), [Dockerfile v1.0.0-rc2](https://github.com/hashtopolis/server/blob/v1.0.0-rc2/Dockerfile) và [Supervisor process states](https://supervisord.org/subprocess.html#process-states).
+
+### Backend `BACKOFF` hoặc `spawn error`
+
+Trong 3.2.0, Supervisor chỉ quản lý Apache dài hạn; `setup.php` đã chạy xong trước đó. Vì vậy `BACKOFF` mới cần xem `backend.log`/`apache-error.log`, còn lỗi migration nằm riêng trong `migration.log`. Binary `/usr/bin/sqlx` luôn được publish và kiểm tra đúng `sqlx-cli 0.9.0` trước bước setup.
 
 ### Cảnh báo Apache `Could not reliably determine the server's fully qualified domain name`
 
@@ -590,9 +614,9 @@ Không dùng `WIPE_DATA=1` và không cần `FORCE_REBUILD=1`; database cùng re
 
 ### `link: unbound variable` ở bước 06/10
 
-Lỗi này thuộc bản monolith 3.0.0, được sửa trong 3.0.1 và bản sửa tiếp tục nằm trong module `20-releases.sh` của release 3.1.2. Hàm tạo symlink cũ từng khai báo `link` rồi tham chiếu `${link}` trong cùng một lệnh `local`; với `set -u`, Bash mở rộng tham số trước khi builtin `local` hoàn tất phép gán nên script dừng tại nhánh reuse backend.
+Lỗi này thuộc bản monolith 3.0.0, được sửa trong 3.0.1 và bản sửa tiếp tục nằm trong module `20-releases.sh` của release 3.2.0. Hàm tạo symlink cũ từng khai báo `link` rồi tham chiếu `${link}` trong cùng một lệnh `local`; với `set -u`, Bash mở rộng tham số trước khi builtin `local` hoàn tất phép gán nên script dừng tại nhánh reuse backend.
 
-Đảm bảo repository đã có trọn bộ 3.1.2, thay `/root/run.sh` bằng loader mới rồi chạy lại:
+Đảm bảo repository đã có trọn bộ 3.2.0, thay `/root/run.sh` bằng loader mới rồi chạy lại:
 
 ```bash
 chmod +x /root/run.sh
@@ -611,7 +635,7 @@ Trong SSH mode, port `8080` thường trống. Nếu đang dùng Jupyter, đổi
 
 ### Build `sqlx` lâu
 
-Lần đầu script cài Rust toolchain tối thiểu và compile `sqlx-cli` với MySQL support vì backend dùng SQLx migrations. Binary cuối được cache tại:
+Lần đầu script cài Rust `1.94.0` và compile đúng `sqlx-cli 0.9.0` với MySQL support vì backend dùng SQLx migrations. Binary cache/system chỉ được reuse khi `sqlx --version` khớp chính xác:
 
 ```text
 APP_DIR/tools/bin/sqlx
@@ -641,7 +665,7 @@ tail -n 200 /var/log/kiquai-hashtopolis/apache-error.log
 tail -n 200 /var/log/kiquai-hashtopolis/mysql.log
 ```
 
-Backend launcher đợi MySQL, chạy `src/inc/startup/setup.php` dưới user `www-data`, rồi mới start Apache. Lỗi migration sẽ được giữ trong `backend.log`.
+Backend launcher chỉ kiểm tra migration gate rồi start Apache; nó không gọi `setup.php`. Migration đồng bộ nằm trong `migration.log`. Nếu backend restart liên tục, trước hết xác nhận marker `APP_DIR/run/backend-ready` khớp release active và xem `apache-error.log`.
 
 ### Public URL hoặc CORS sai
 

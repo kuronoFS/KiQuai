@@ -2,7 +2,7 @@
 # shellcheck shell=bash
 # KiQuai module: core
 # kiquai-module-api: 1
-# kiquai-release: 3.1.2
+# kiquai-release: 3.2.0
 
 set -Eeuo pipefail
 shopt -s inherit_errexit 2>/dev/null || true
@@ -25,9 +25,11 @@ fi
 # This script intentionally does not install or start Docker, dockerd, Compose,
 # containerd, a nested network namespace, or a socat port forwarder.
 
-readonly SCRIPT_VERSION="3.1.2"
+readonly SCRIPT_VERSION="3.2.0"
 readonly SCRIPT_NAME="KiQuai Hashtopolis modular single-container bootstrap"
 readonly TOTAL_STEPS=10
+readonly SQLX_CLI_VERSION="0.9.0"
+readonly RUST_TOOLCHAIN_VERSION="1.94.0"
 
 umask 077
 export DEBIAN_FRONTEND=noninteractive
@@ -40,7 +42,7 @@ for _name in \
   MYSQL_ROOT_PASS MYSQL_DATABASE MYSQL_USER MYSQL_PASSWORD \
   HASHTOPOLIS_ADMIN_USER HASHTOPOLIS_ADMIN_PASSWORD \
   HASHTOPOLIS_BACKEND_URL HASHTOPOLIS_FRONTEND_PORT \
-  AGENT_ENABLED AGENT_VOUCHER AGENT_DOWNLOAD_URL; do
+  AGENT_ENABLED AGENT_VOUCHER AGENT_DOWNLOAD_URL REQUIRE_HASHCAT_GPU; do
   if [[ -v ${_name} ]]; then
     CALLER_SET["${_name}"]=1
   else
@@ -108,13 +110,19 @@ SERVER_CURRENT=""
 FRONTEND_CURRENT=""
 MYSQL_CONFIG=""
 NGINX_CONFIG=""
+RUNTIME_ENV_FILE=""
+BACKEND_READY_FILE=""
+MIGRATION_LOG=""
+SERVER_RELEASE_TARGET=""
+FRONTEND_RELEASE_TARGET=""
 
 CURRENT_STEP=0
 CURRENT_STAGE="initialization"
+CURRENT_COMMAND=""
 STAGE_STARTED_AT=0
 SCRIPT_STARTED_AT=$SECONDS
+RUN_ID=""
 DEPLOYMENT_COMPLETE=0
-LAST_ERROR_CODE=0
 LAST_ERROR_MODULE=""
 LAST_ERROR_SOURCE=""
 LAST_ERROR_LINE=""
@@ -171,8 +179,9 @@ _log() {
   done
   module="${source##*/}"
   shift 2
-  printf '%s[%s] %-5s%s [module=%s] %s\n' \
-    "${color}" "$(timestamp)" "${level}" "${C_RESET}" "${module}" "$*"
+  printf '%s[%s] %-5s%s [run=%s] [module=%s] %s\n' \
+    "${color}" "$(timestamp)" "${level}" "${C_RESET}" \
+    "${RUN_ID:-not-started}" "${module}" "$*"
 }
 
 info()    { _log INFO  "${C_BLUE}" "$@"; }
@@ -208,7 +217,6 @@ end_step() {
 
 die() {
   LAST_ERROR_MESSAGE="$*"
-  LAST_ERROR_CODE=1
   LAST_ERROR_SOURCE="${BASH_SOURCE[1]:-unknown}"
   LAST_ERROR_MODULE="${LAST_ERROR_SOURCE##*/}"
   LAST_ERROR_LINE="${BASH_LINENO[0]:-unknown}"
@@ -230,7 +238,6 @@ record_error() {
   local caller_source="$6"
   local caller_line="$7"
   local caller_function="$8"
-  LAST_ERROR_CODE="${code}"
   LAST_ERROR_SOURCE="${source}"
   LAST_ERROR_MODULE="${source##*/}"
   LAST_ERROR_LINE="${line}"
@@ -270,7 +277,12 @@ on_exit() {
   if (( code != 0 )); then
     printf '\n%s' "${C_RED}" >&2
     printf '%s\n' '!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!' >&2
-    printf 'DEPLOYMENT FAILED (exit=%s, stage=%s)\n' "${code}" "${CURRENT_STAGE}" >&2
+    if [[ "${CURRENT_COMMAND}" == "deploy" || "${CURRENT_COMMAND}" == "restart" ]]; then
+      printf 'DEPLOYMENT FAILED (exit=%s, stage=%s)\n' "${code}" "${CURRENT_STAGE}" >&2
+    else
+      printf 'COMMAND FAILED (command=%s, exit=%s, stage=%s)\n' \
+        "${CURRENT_COMMAND:-unknown}" "${code}" "${CURRENT_STAGE}" >&2
+    fi
     printf '%s\n' '!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!' >&2
     printf '%s' "${C_RESET}" >&2
     [[ -n "${LAST_ERROR_MESSAGE}" ]] && printf 'Reason : %s\n' "${LAST_ERROR_MESSAGE}" >&2
@@ -284,6 +296,7 @@ on_exit() {
         "${LAST_ERROR_CALLER_FUNCTION:-unknown}" >&2
     fi
     [[ -n "${LAST_ERROR_COMMAND}" ]] && printf 'Command: %s\n' "${LAST_ERROR_COMMAND}" >&2
+    [[ -n "${RUN_ID}" ]] && printf 'Run ID : %s\n' "${RUN_ID}" >&2
     printf 'Log    : %s\n' "${MAIN_LOG}" >&2
     printf 'Loader : %s\n' "${KIQUAI_LOADER_LOG:-not configured}" >&2
     if [[ "${DIAGNOSTICS_ON_FAILURE}" == "1" ]] && [[ -n "${APP_DIR}" ]]; then
@@ -307,6 +320,8 @@ init_logging() {
   touch "${MAIN_LOG}"
   chmod 600 "${MAIN_LOG}"
   exec > >(tee -a "${MAIN_LOG}") 2>&1
+  printf '\n[%s] ===== KiQuai run start: run=%s command=%s version=%s pid=%s =====\n' \
+    "$(timestamp)" "${RUN_ID}" "${CURRENT_COMMAND}" "${SCRIPT_VERSION}" "$$"
 }
 
 install_traps() {
@@ -431,7 +446,7 @@ load_saved_config() {
     MYSQL_ROOT_PASS MYSQL_DATABASE MYSQL_USER MYSQL_PASSWORD \
     HASHTOPOLIS_ADMIN_USER HASHTOPOLIS_ADMIN_PASSWORD \
     HASHTOPOLIS_BACKEND_URL HASHTOPOLIS_FRONTEND_PORT \
-    AGENT_ENABLED AGENT_VOUCHER AGENT_DOWNLOAD_URL; do
+    AGENT_ENABLED AGENT_VOUCHER AGENT_DOWNLOAD_URL REQUIRE_HASHCAT_GPU; do
     if [[ "${CALLER_SET[${name}]:-0}" == "0" ]]; then
       saved="$(dotenv_get "${name}" "${APP_DIR}/.env" 2>/dev/null || true)"
       if [[ -n "${saved}" ]]; then
@@ -474,6 +489,9 @@ apply_defaults() {
   FRONTEND_CURRENT="${CURRENT_DIR}/frontend"
   MYSQL_CONFIG="${CONFIG_DIR}/mysql.cnf"
   NGINX_CONFIG="${CONFIG_DIR}/nginx.conf"
+  RUNTIME_ENV_FILE="${CONFIG_DIR}/runtime-env.sh"
+  BACKEND_READY_FILE="${RUN_DIR}/backend-ready"
+  MIGRATION_LOG="${LOG_DIR}/migration.log"
 }
 
 resolve_public_url() {
@@ -483,15 +501,18 @@ resolve_public_url() {
   PUBLIC_IP="${PUBLIC_IPADDR-}"
   PUBLIC_PORT="${detected_port:-${INTERNAL_PORT}}"
 
-  if [[ -z "${PUBLIC_IP}" ]] && have_cmd curl; then
-    PUBLIC_IP="$(curl -4fsS --max-time 8 https://api.ipify.org 2>/dev/null || true)"
-  fi
-  if [[ -z "${PUBLIC_IP}" ]]; then
-    PUBLIC_IP="127.0.0.1"
-    warn "PUBLIC_IPADDR is unavailable. Set PUBLIC_URL if this is a public deployment."
-  fi
   if [[ -z "${PUBLIC_URL}" ]]; then
+    if [[ -z "${PUBLIC_IP}" ]] && have_cmd curl; then
+      PUBLIC_IP="$(curl -4fsS --max-time 8 https://api.ipify.org 2>/dev/null || true)"
+    fi
+    if [[ -z "${PUBLIC_IP}" ]]; then
+      PUBLIC_IP="127.0.0.1"
+      warn "PUBLIC_IPADDR is unavailable. Set PUBLIC_URL if this is a public deployment."
+    fi
     PUBLIC_URL="http://${PUBLIC_IP}:${PUBLIC_PORT}"
+    if [[ -z "${detected_port}" ]]; then
+      warn "${port_var} is not set; verify the public URL shown after deployment."
+    fi
   fi
   PUBLIC_URL="${PUBLIC_URL%/}"
 
@@ -508,20 +529,22 @@ resolve_public_url() {
     effective_port=80
   fi
   PUBLIC_PORT="${effective_port}"
-
-  if [[ -z "${detected_port}" ]]; then
-    warn "${port_var} is not set; verify the public URL shown after deployment."
-  fi
 }
 
 resolve_credentials() {
   [[ -n "${MYSQL_ROOT_PASS}" ]] || MYSQL_ROOT_PASS="$(rand_secret)"
   [[ -n "${MYSQL_PASSWORD}" ]] || MYSQL_PASSWORD="$(rand_secret)"
   [[ -n "${HASHTOPOLIS_ADMIN_PASSWORD}" ]] || HASHTOPOLIS_ADMIN_PASSWORD="$(rand_secret)"
-  [[ -n "${HASHTOPOLIS_BACKEND_URL}" ]] \
-    || HASHTOPOLIS_BACKEND_URL="${PUBLIC_URL}/api/v2"
-  [[ -n "${HASHTOPOLIS_FRONTEND_PORT}" ]] \
-    || HASHTOPOLIS_FRONTEND_PORT="${PUBLIC_PORT}"
+  if [[ "${CALLER_SET[PUBLIC_URL]:-0}" == "1" && "${CALLER_SET[HASHTOPOLIS_BACKEND_URL]:-0}" == "0" ]]; then
+    HASHTOPOLIS_BACKEND_URL="${PUBLIC_URL}/api/v2"
+  elif [[ -z "${HASHTOPOLIS_BACKEND_URL}" ]]; then
+    HASHTOPOLIS_BACKEND_URL="${PUBLIC_URL}/api/v2"
+  fi
+  if [[ "${CALLER_SET[PUBLIC_URL]:-0}" == "1" && "${CALLER_SET[HASHTOPOLIS_FRONTEND_PORT]:-0}" == "0" ]]; then
+    HASHTOPOLIS_FRONTEND_PORT="${PUBLIC_PORT}"
+  elif [[ -z "${HASHTOPOLIS_FRONTEND_PORT}" ]]; then
+    HASHTOPOLIS_FRONTEND_PORT="${PUBLIC_PORT}"
+  fi
   if [[ -n "${AGENT_VOUCHER}" ]]; then
     AGENT_ENABLED=1
   fi
@@ -569,8 +592,25 @@ validate_config() {
     || die "HASHTOPOLIS_ADMIN_PASSWORD is invalid."
   [[ "${PUBLIC_URL}" =~ ^https?://[^/[:space:]]+$ ]] \
     || die "PUBLIC_URL must be an HTTP or HTTPS origin without a path."
+  [[ "${HASHTOPOLIS_BACKEND_URL}" =~ ^https?://[^/[:space:]]+/api/v2$ ]] \
+    || die "HASHTOPOLIS_BACKEND_URL must be an HTTP(S) URL ending in /api/v2."
+  [[ "${HASHTOPOLIS_BACKEND_URL}" != *\"* && "${HASHTOPOLIS_BACKEND_URL}" != *"'"* ]] \
+    || die "HASHTOPOLIS_BACKEND_URL contains unsupported quote characters."
   [[ -z "${AGENT_VOUCHER}" || "${AGENT_VOUCHER}" =~ ^[A-Za-z0-9_-]+$ ]] \
     || die "AGENT_VOUCHER contains unsupported characters."
+
+  [[ "${MAIN_LOG}" == "${LOG_DIR}/"* ]] \
+    || die "MAIN_LOG must be a file below LOG_DIR."
+  [[ "${HASHCAT_LOG}" == "${LOG_DIR}/"* ]] \
+    || die "HASHCAT_LOG must be a file below LOG_DIR."
+  [[ "${MAIN_LOG}" =~ ^/[A-Za-z0-9._/-]+$ && "${HASHCAT_LOG}" =~ ^/[A-Za-z0-9._/-]+$ ]] \
+    || die "Log file paths contain unsupported characters."
+  [[ "${LOCK_FILE}" == /* && "${LOCK_FILE}" =~ ^/[A-Za-z0-9._/-]+$ ]] \
+    || die "LOCK_FILE must be a safe absolute path."
+  case "${LOCK_FILE}" in
+    /var/lock/*|"${RUN_DIR}/"*) ;;
+    *) die "LOCK_FILE must be below /var/lock or RUN_DIR." ;;
+  esac
 }
 
 write_dotenv() {
@@ -598,6 +638,7 @@ write_dotenv() {
   write_env_line AGENT_ENABLED "${AGENT_ENABLED}" "${temp}"
   write_env_line AGENT_VOUCHER "${AGENT_VOUCHER}" "${temp}"
   write_env_line AGENT_DOWNLOAD_URL "${AGENT_DOWNLOAD_URL}" "${temp}"
+  write_env_line REQUIRE_HASHCAT_GPU "${REQUIRE_HASHCAT_GPU}" "${temp}"
   chmod 600 "${temp}"
   mv -f "${temp}" "${ENV_FILE}"
 }

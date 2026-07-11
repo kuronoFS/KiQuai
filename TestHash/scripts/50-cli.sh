@@ -2,7 +2,7 @@
 # shellcheck shell=bash
 # KiQuai module: cli
 # kiquai-module-api: 1
-# kiquai-release: 3.1.2
+# kiquai-release: 3.2.0
 
 if [[ "${KIQUAI_MODULE_CONTEXT:-0}" != "1" ]]; then
   printf 'This file is a KiQuai module; run ../run.sh instead.\n' >&2
@@ -18,6 +18,7 @@ redacted_environment() {
       if (key ~ /(PASS|PASSWORD|VOUCHER|TOKEN|SECRET)/) {
         print key "='\''<redacted>'\''"
       } else {
+        gsub(/:\/\/[^\/@:]+:[^\/@]+@/, "://<redacted>@")
         print
       }
     }
@@ -28,11 +29,11 @@ collect_diagnostics() {
   local diagnostics_dir="${LOG_DIR}/diagnostics"
   mkdir -p "${diagnostics_dir}"
   chmod 700 "${diagnostics_dir}"
-  LAST_DIAGNOSTIC_FILE="${diagnostics_dir}/diagnostic-$(date '+%Y%m%d-%H%M%S').log"
+  LAST_DIAGNOSTIC_FILE="${diagnostics_dir}/diagnostic-$(date '+%Y%m%d-%H%M%S')-$$.log"
   {
     printf 'KiQuai diagnostic report\n'
-    printf 'generated=%s\nscript_version=%s\nstage=%s\nmodule=%s\nsource=%s\nline=%s\nfunction=%s\ncaller_source=%s\ncaller_line=%s\ncaller_function=%s\ncommand=%s\n\n' \
-      "$(timestamp)" "${SCRIPT_VERSION}" "${CURRENT_STAGE}" \
+    printf 'generated=%s\nrun_id=%s\ncommand_name=%s\nscript_version=%s\nstage=%s\nmodule=%s\nsource=%s\nline=%s\nfunction=%s\ncaller_source=%s\ncaller_line=%s\ncaller_function=%s\ncommand=%s\n\n' \
+      "$(timestamp)" "${RUN_ID}" "${CURRENT_COMMAND}" "${SCRIPT_VERSION}" "${CURRENT_STAGE}" \
       "${LAST_ERROR_MODULE:-}" "${LAST_ERROR_SOURCE:-}" "${LAST_ERROR_LINE:-}" \
       "${LAST_ERROR_FUNCTION:-}" "${LAST_ERROR_CALLER_SOURCE:-}" \
       "${LAST_ERROR_CALLER_LINE:-}" "${LAST_ERROR_CALLER_FUNCTION:-}" \
@@ -63,6 +64,17 @@ collect_diagnostics() {
     ls -l "${TOOLS_DIR}/bin/sqlx" /usr/bin/sqlx 2>&1 || true
     "${TOOLS_DIR}/bin/sqlx" --version 2>&1 || true
     /usr/bin/sqlx --version 2>&1 || true
+    printf '\n===== SQLx migration state =====\n'
+    if MYSQL_PWD="${MYSQL_PASSWORD}" mysql --protocol=tcp -h 127.0.0.1 \
+        -P "${DB_PORT}" -u "${MYSQL_USER}" -D "${MYSQL_DATABASE}" \
+        -Nse 'SELECT 1' >/dev/null 2>&1; then
+      failed_migration_rows 2>&1 || true
+      mysql_app_exec -e \
+        'SELECT version, description, installed_on, success, execution_time FROM _sqlx_migrations ORDER BY version DESC LIMIT 20;' \
+        2>&1 || true
+    else
+      printf 'Application database is not reachable with saved credentials.\n'
+    fi
     printf '\n===== PHP modules =====\n'
     php -m 2>&1 || true
     printf '\n===== NVIDIA =====\n'
@@ -74,7 +86,7 @@ collect_diagnostics() {
       "http://127.0.0.1:${INTERNAL_PORT}/" 2>&1 || true
     printf '\n===== Bounded logs =====\n'
     local log
-    for log in mysql.log backend.log apache-error.log nginx-error.log agent.log supervisord.log; do
+    for log in migration.log mysql.log mysql-supervisor.log backend.log apache-error.log nginx-error.log nginx-supervisor.log agent.log supervisord.log bootstrap.log loader.log; do
       printf '\n--- %s ---\n' "${log}"
       tail -n 160 "${LOG_DIR}/${log}" 2>&1 || true
     done
@@ -130,6 +142,13 @@ print_success() {
     [[ "${state}" == "RUNNING" ]] \
       || die "Required Supervisor program '${program}' is ${state:-unknown}, not RUNNING."
   done
+  if [[ "${AGENT_ENABLED}" == "1" ]]; then
+    state="$(supervisor_program_state agent)"
+    [[ "${state}" == "RUNNING" ]] \
+      || die "AGENT_ENABLED=1 but Supervisor program 'agent' is ${state:-unknown}, not RUNNING."
+    [[ -s "${AGENT_DIR}/config.json" ]] \
+      || die "AGENT_ENABLED=1 but the local agent has no completed config.json registration."
+  fi
   supervisor_ctl status || true
   printf '\n%s' "${C_GREEN}"
   print_rule
@@ -198,25 +217,68 @@ command_preflight() {
 
 command_status() {
   require_existing_installation
+  local failed=0
+  local failed_rows=""
+  local program=""
+  local state=""
   if supervisor_is_running; then
     supervisor_ctl status || true
+    for program in mysql backend nginx; do
+      state="$(supervisor_program_state "${program}")"
+      if [[ "${state}" != "RUNNING" ]]; then
+        error "Required Supervisor program '${program}' is ${state:-unknown}."
+        failed=1
+      fi
+    done
+    if [[ "${AGENT_ENABLED}" == "1" ]]; then
+      state="$(supervisor_program_state agent)"
+      if [[ "${state}" != "RUNNING" ]]; then
+        error "AGENT_ENABLED=1 but the agent is ${state:-unknown}."
+        failed=1
+      fi
+    fi
   else
     error "KiQuai supervisord is not running."
+    failed=1
   fi
-  local code
-  code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 8 \
-    "http://127.0.0.1:${INTERNAL_PORT}/" 2>/dev/null || true)"
-  [[ "${code}" =~ ^[0-9]{3}$ ]] || code=000
-  printf 'HTTP status: %s\n' "${code}"
+  if check_http_contract; then
+    success "HTTP contract passed (frontend=${HEALTH_FRONTEND_CODE}, agent_api=${HEALTH_API_CODE})."
+  else
+    error "HTTP contract failed (frontend=${HEALTH_FRONTEND_CODE}, agent_api=${HEALTH_API_CODE})."
+    failed=1
+  fi
   if MYSQL_PWD="${MYSQL_PASSWORD}" mysql --protocol=tcp -h 127.0.0.1 \
       -P "${DB_PORT}" -u "${MYSQL_USER}" -Nse 'SELECT 1' >/dev/null 2>&1; then
     success "Database login passed."
+    if ! failed_rows="$(failed_migration_rows 2>/dev/null)"; then
+      error "Database login passed but SQLx migration state could not be inspected."
+      failed=1
+    elif [[ -n "${failed_rows}" ]]; then
+      error "Database contains at least one partially applied SQLx migration."
+      failed=1
+    fi
   else
     error "Database login failed."
+    failed=1
   fi
-  nvidia-smi --query-gpu=index,name,driver_version,memory.total,utilization.gpu \
-    --format=csv,noheader 2>/dev/null || true
-  hashcat -I 2>/dev/null | sed -n '1,100p' || true
+  if ! nvidia-smi --query-gpu=index,name,driver_version,memory.total,utilization.gpu \
+      --format=csv,noheader 2>/dev/null; then
+    if [[ "${REQUIRE_HASHCAT_GPU}" == "1" ]]; then
+      error "NVIDIA GPU status is unavailable."
+      failed=1
+    else
+      warn "NVIDIA GPU status is unavailable in server-only mode."
+    fi
+  fi
+  if ! hashcat -I 2>/dev/null | sed -n '1,100p'; then
+    if [[ "${REQUIRE_HASHCAT_GPU}" == "1" ]]; then
+      error "Hashcat backend status is unavailable."
+      failed=1
+    else
+      warn "Hashcat backend status is unavailable in server-only mode."
+    fi
+  fi
+  return "${failed}"
 }
 
 command_credentials() {
@@ -240,7 +302,7 @@ command_logs() {
   require_existing_installation
   supervisor_is_running && supervisor_ctl status || true
   local log
-  for log in mysql.log backend.log apache-error.log nginx-error.log agent.log supervisord.log; do
+  for log in migration.log mysql.log mysql-supervisor.log backend.log apache-error.log nginx-error.log nginx-supervisor.log agent.log supervisord.log bootstrap.log loader.log; do
     printf '\n===== %s =====\n' "${log}"
     tail -n 220 "${LOG_DIR}/${log}" 2>/dev/null || true
   done
@@ -271,7 +333,18 @@ command_agent_start() {
   AGENT_ENABLED=1
   validate_config
   write_dotenv
-  supervisor_is_running || start_or_reload_supervisor
+  printf '%s\n' "${RUN_ID}" > "${RUN_DIR}/current-run-id"
+  chmod 600 "${RUN_DIR}/current-run-id"
+  if ! supervisor_is_running || ! check_http_contract; then
+    warn "The web stack is not healthy; reconciling it before starting the agent."
+    quiesce_application_services
+    start_or_reload_supervisor
+    restart_or_start_supervisor_program mysql 180
+    wait_for_mysql
+    provision_database
+    run_backend_setup
+    start_web_services_after_migration
+  fi
   wait_for_http
   download_agent
   reconcile_agent_process
@@ -331,16 +404,22 @@ deploy() {
   build_frontend_release
   end_step
 
-  begin_step "Generate MySQL, Apache, Nginx, and supervisor configuration"
+  begin_step "Quiesce, activate releases, and generate validated configuration"
+  quiesce_application_services
+  activate_releases
+  printf '%s\n' "${RUN_ID}" > "${RUN_DIR}/current-run-id"
+  chmod 600 "${RUN_DIR}/current-run-id"
   write_runtime_configs
   initialize_mysql_data
   end_step
 
-  begin_step "Start native processes and provision the database"
+  begin_step "Provision MySQL, run migrations once, then start web services"
   start_or_reload_supervisor
+  restart_or_start_supervisor_program mysql 180
   wait_for_mysql
   provision_database
-  restart_web_services
+  run_backend_setup
+  start_web_services_after_migration
   end_step
 
   begin_step "Verify HTTP routes and install the Python agent"
@@ -371,17 +450,20 @@ main() {
       ;;
   esac
 
+  CURRENT_COMMAND="${command}"
   CURRENT_STAGE="command:${command}"
   CURRENT_MODULE="50-cli.sh"
+  RUN_ID="${KIQUAI_RUN_ID:-$(date '+%Y%m%dT%H%M%S%z')-$$}"
   require_root
-  mkdir -p "${LOG_DIR}"
-  init_logging
-  install_traps
   load_saved_config
   apply_defaults
   resolve_public_url
   resolve_credentials
   validate_config
+  mkdir -p "${LOG_DIR}"
+  init_logging
+  install_traps
+  info "Starting command '${command}' with KiQuai ${SCRIPT_VERSION}."
 
   case "${command}" in
     deploy) deploy ;;

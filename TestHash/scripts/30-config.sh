@@ -2,7 +2,7 @@
 # shellcheck shell=bash
 # KiQuai module: config
 # kiquai-module-api: 1
-# kiquai-release: 3.1.2
+# kiquai-release: 3.2.0
 
 if [[ "${KIQUAI_MODULE_CONTEXT:-0}" != "1" ]]; then
   printf 'This file is a KiQuai module; run ../run.sh instead.\n' >&2
@@ -10,10 +10,11 @@ if [[ "${KIQUAI_MODULE_CONTEXT:-0}" != "1" ]]; then
 fi
 
 write_mysql_config() {
+  local temp="${MYSQL_CONFIG}.tmp.$$"
   touch "${LOG_DIR}/mysql.log"
   chown mysql:mysql "${LOG_DIR}/mysql.log"
   chmod 640 "${LOG_DIR}/mysql.log"
-  cat > "${MYSQL_CONFIG}" <<EOF
+  cat > "${temp}" <<EOF
 [mysqld]
 user=mysql
 datadir=${MYSQL_DATA_DIR}
@@ -32,8 +33,9 @@ socket=${MYSQL_RUN_DIR}/mysqld.sock
 port=${DB_PORT}
 host=127.0.0.1
 EOF
-  chown mysql:mysql "${MYSQL_CONFIG}"
-  chmod 600 "${MYSQL_CONFIG}"
+  chown mysql:mysql "${temp}"
+  chmod 600 "${temp}"
+  mv -f "${temp}" "${MYSQL_CONFIG}"
 }
 
 write_php_config() {
@@ -106,17 +108,25 @@ EOF
 write_frontend_config() {
   local example="${FRONTEND_CURRENT}/dist/assets/config.json.example"
   local target="${FRONTEND_CURRENT}/dist/assets/config.json"
+  local temp="${target}.tmp.$$"
+  local themes_target="${FRONTEND_CURRENT}/dist/assets/themes/custom-themes.json"
+  local themes_temp="${themes_target}.tmp.$$"
   [[ -f "${example}" ]] || die "Frontend config template is missing: ${example}"
-  HASHTOPOLIS_BACKEND_URL="${HASHTOPOLIS_BACKEND_URL}" \
-    envsubst '${HASHTOPOLIS_BACKEND_URL}' < "${example}" > "${target}"
   mkdir -p "${FRONTEND_CURRENT}/dist/assets/themes"
-  printf '%s\n' '[]' > "${FRONTEND_CURRENT}/dist/assets/themes/custom-themes.json"
-  chown root:www-data "${target}" "${FRONTEND_CURRENT}/dist/assets/themes/custom-themes.json"
-  chmod 640 "${target}" "${FRONTEND_CURRENT}/dist/assets/themes/custom-themes.json"
+  jq --arg backend_url "${HASHTOPOLIS_BACKEND_URL}" \
+    '.hashtopolis_backend_url = $backend_url' "${example}" > "${temp}"
+  jq -e '.hashtopolis_backend_url | type == "string" and endswith("/api/v2")' \
+    "${temp}" >/dev/null || die "Generated frontend config is invalid."
+  printf '%s\n' '[]' > "${themes_temp}"
+  chown root:www-data "${temp}" "${themes_temp}"
+  chmod 640 "${temp}" "${themes_temp}"
+  mv -f "${temp}" "${target}"
+  mv -f "${themes_temp}" "${themes_target}"
 }
 
 write_nginx_config() {
-  cat > "${NGINX_CONFIG}" <<EOF
+  local temp="${NGINX_CONFIG}.tmp.$$"
+  cat > "${temp}" <<EOF
 user www-data;
 worker_processes auto;
 pid ${RUN_DIR}/nginx.pid;
@@ -190,22 +200,26 @@ http {
     }
 }
 EOF
-  chmod 640 "${NGINX_CONFIG}"
-  nginx -t -c "${NGINX_CONFIG}"
+  chmod 640 "${temp}"
+  nginx -t -c "${temp}"
+  mv -f "${temp}" "${NGINX_CONFIG}"
 }
 
-write_backend_launcher() {
-  cat > "${CONFIG_DIR}/start-backend.sh" <<'EOF'
+write_runtime_environment() {
+  cat > "${RUNTIME_ENV_FILE}" <<'EOF'
 #!/usr/bin/env bash
-set -Eeuo pipefail
-set -a
-source "__ENV_FILE__"
-set +a
+if [[ "${KIQUAI_RUNTIME_CONFIG_LOADED:-0}" != "1" ]]; then
+  set -a
+  source "__ENV_FILE__"
+  set +a
+fi
 
 SERVER_CURRENT="${APP_DIR}/current/server"
 HASHTOPOLIS_DATA_DIR="${APP_DIR}/data/hashtopolis"
-export PATH="${APP_DIR}/tools/bin:${PATH}"
-export PATH="/usr/local/nvidia/bin:${PATH}"
+RUN_DIR="${APP_DIR}/run"
+BACKEND_READY_FILE="${RUN_DIR}/backend-ready"
+KIQUAI_RUN_ID="$(cat "${RUN_DIR}/current-run-id" 2>/dev/null || printf 'service-restart')"
+export PATH="${APP_DIR}/tools/bin:/usr/local/nvidia/bin:${PATH}"
 export LD_LIBRARY_PATH="/usr/local/nvidia/lib:/usr/local/nvidia/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 export HASHTOPOLIS_DOCUMENT_ROOT="${SERVER_CURRENT}/src"
 export HASHTOPOLIS_PATH="${HASHTOPOLIS_DATA_DIR}"
@@ -224,43 +238,44 @@ export HASHTOPOLIS_DB_USER="${MYSQL_USER}"
 export HASHTOPOLIS_DB_PASS="${MYSQL_PASSWORD}"
 export HASHTOPOLIS_DB_DATABASE="${MYSQL_DATABASE}"
 export HASHTOPOLIS_APIV2_ENABLE="1"
+export HASHTOPOLIS_ADMIN_USER HASHTOPOLIS_ADMIN_PASSWORD
+export HASHTOPOLIS_BACKEND_URL HASHTOPOLIS_FRONTEND_PORT
 
-[[ -x /usr/bin/sqlx ]] || {
-  echo "Required migration binary /usr/bin/sqlx is missing or not executable." >&2
-  exit 1
+runtime_log() {
+  local level="$1"
+  shift
+  printf '[%s] %-5s [run=%s] [component=%s] %s\n' \
+    "$(date '+%Y-%m-%d %H:%M:%S%z')" "${level}" "${KIQUAI_RUN_ID}" \
+    "${KIQUAI_COMPONENT:-runtime}" "$*"
 }
+EOF
+  sed -i "s|__ENV_FILE__|${ENV_FILE}|g" "${RUNTIME_ENV_FILE}"
+  chmod 700 "${RUNTIME_ENV_FILE}"
+}
+
+write_backend_launcher() {
+  cat > "${CONFIG_DIR}/start-backend.sh" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+source "__RUNTIME_ENV_FILE__"
+KIQUAI_COMPONENT="backend"
+
+expected_ready="${HASHTOPOLIS_VERSION}|$(readlink -f "${SERVER_CURRENT}")"
+actual_ready="$(cat "${BACKEND_READY_FILE}" 2>/dev/null || true)"
+if [[ "${actual_ready}" != "${expected_ready}" ]]; then
+  runtime_log ERROR "Backend start refused: the synchronous migration gate is not complete for the active release."
+  runtime_log ERROR "Expected marker '${expected_ready}', found '${actual_ready:-missing}'. Run './run.sh deploy'."
+  exit 1
+fi
 if ! runuser -u www-data -- test -w "${SERVER_CURRENT}/src/inc/utils/locks"; then
-  echo "Hashtopolis lock directory is not writable by www-data: ${SERVER_CURRENT}/src/inc/utils/locks" >&2
+  runtime_log ERROR "Hashtopolis lock directory is not writable by www-data: ${SERVER_CURRENT}/src/inc/utils/locks"
   exit 1
 fi
 
-for _attempt in $(seq 1 120); do
-  if MYSQL_PWD="${MYSQL_PASSWORD}" mysql --protocol=tcp \
-      -h 127.0.0.1 -P "${DB_PORT}" -u "${MYSQL_USER}" \
-      -D "${MYSQL_DATABASE}" -Nse 'SELECT 1' >/dev/null 2>&1; then
-    break
-  fi
-  if [[ "${_attempt}" == "120" ]]; then
-    echo "Backend timed out waiting for the application database." >&2
-    exit 1
-  fi
-  sleep 2
-done
-
-echo "Starting Hashtopolis migration/setup."
-set +e
-runuser -u www-data --preserve-environment -- \
-  php -f "${SERVER_CURRENT}/src/inc/startup/setup.php"
-setup_rc=$?
-set -e
-if (( setup_rc != 0 )); then
-  echo "Hashtopolis setup.php failed (exit=${setup_rc})." >&2
-  exit "${setup_rc}"
-fi
-echo "Hashtopolis migration/setup completed."
+runtime_log INFO "Starting Apache for Hashtopolis ${HASHTOPOLIS_VERSION}; migrations already completed."
 exec /usr/sbin/apache2ctl -DFOREGROUND
 EOF
-  sed -i "s|__ENV_FILE__|${ENV_FILE}|g" "${CONFIG_DIR}/start-backend.sh"
+  sed -i "s|__RUNTIME_ENV_FILE__|${RUNTIME_ENV_FILE}|g" "${CONFIG_DIR}/start-backend.sh"
   chmod 700 "${CONFIG_DIR}/start-backend.sh"
 }
 
@@ -268,18 +283,15 @@ write_agent_launcher() {
   cat > "${CONFIG_DIR}/start-agent.sh" <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
-set -a
-source "__ENV_FILE__"
-set +a
+source "__RUNTIME_ENV_FILE__"
+KIQUAI_COMPONENT="agent"
 AGENT_DIR="${APP_DIR}/agent"
-export PATH="/usr/local/nvidia/bin:${PATH}"
-export LD_LIBRARY_PATH="/usr/local/nvidia/lib:/usr/local/nvidia/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 cd "${AGENT_DIR}"
 
 for _attempt in $(seq 1 150); do
   [[ -f "${AGENT_DIR}/hashtopolis.zip" ]] && break
   if [[ "${_attempt}" == "150" ]]; then
-    echo "Agent package did not become available." >&2
+    runtime_log ERROR "Agent package did not become available."
     exit 1
   fi
   sleep 2
@@ -296,23 +308,21 @@ args=(
 )
 if [[ ! -s "${AGENT_DIR}/config.json" ]]; then
   [[ -n "${AGENT_VOUCHER}" ]] || {
-    echo "No agent config or AGENT_VOUCHER is available." >&2
+    runtime_log ERROR "No agent config or AGENT_VOUCHER is available."
     exit 1
   }
   args+=(--voucher "${AGENT_VOUCHER}")
 fi
+runtime_log INFO "Starting the Hashtopolis Python agent."
 exec "${args[@]}"
 EOF
-  sed -i "s|__ENV_FILE__|${ENV_FILE}|g" "${CONFIG_DIR}/start-agent.sh"
+  sed -i "s|__RUNTIME_ENV_FILE__|${RUNTIME_ENV_FILE}|g" "${CONFIG_DIR}/start-agent.sh"
   chmod 700 "${CONFIG_DIR}/start-agent.sh"
 }
 
 write_supervisor_config() {
-  local agent_autostart="false"
-  if [[ "${AGENT_ENABLED}" == "1" ]]; then
-    agent_autostart="true"
-  fi
-  cat > "${SUPERVISOR_CONFIG}" <<EOF
+  local temp="${SUPERVISOR_CONFIG}.tmp.$$"
+  cat > "${temp}" <<EOF
 [unix_http_server]
 file=${SUPERVISOR_SOCKET}
 chmod=0700
@@ -354,10 +364,10 @@ stdout_logfile_backups=3
 command=/bin/bash ${CONFIG_DIR}/start-backend.sh
 user=root
 priority=20
-autostart=true
+autostart=false
 autorestart=true
-startsecs=10
-startretries=30
+startsecs=5
+startretries=3
 stopasgroup=true
 killasgroup=true
 stopsignal=TERM
@@ -371,7 +381,7 @@ stdout_logfile_backups=3
 command=/usr/sbin/nginx -c ${NGINX_CONFIG} -g "daemon off;"
 user=root
 priority=30
-autostart=true
+autostart=false
 autorestart=true
 startsecs=5
 startretries=20
@@ -389,10 +399,10 @@ command=/bin/bash ${CONFIG_DIR}/start-agent.sh
 directory=${AGENT_DIR}
 user=root
 priority=40
-autostart=${agent_autostart}
+autostart=false
 autorestart=unexpected
 startsecs=10
-startretries=10
+startretries=3
 stopasgroup=true
 killasgroup=true
 stopsignal=TERM
@@ -402,7 +412,8 @@ stdout_logfile=${LOG_DIR}/agent.log
 stdout_logfile_maxbytes=20MB
 stdout_logfile_backups=3
 EOF
-  chmod 600 "${SUPERVISOR_CONFIG}"
+  chmod 600 "${temp}"
+  mv -f "${temp}" "${SUPERVISOR_CONFIG}"
 }
 
 write_runtime_configs() {
@@ -410,6 +421,7 @@ write_runtime_configs() {
   write_apache_config
   write_frontend_config
   write_nginx_config
+  write_runtime_environment
   write_backend_launcher
   write_agent_launcher
   write_supervisor_config
