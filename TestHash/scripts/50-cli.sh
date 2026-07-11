@@ -2,7 +2,7 @@
 # shellcheck shell=bash
 # KiQuai module: cli
 # kiquai-module-api: 1
-# kiquai-release: 3.1.0
+# kiquai-release: 3.1.1
 
 if [[ "${KIQUAI_MODULE_CONTEXT:-0}" != "1" ]]; then
   printf 'This file is a KiQuai module; run ../run.sh instead.\n' >&2
@@ -31,10 +31,12 @@ collect_diagnostics() {
   LAST_DIAGNOSTIC_FILE="${diagnostics_dir}/diagnostic-$(date '+%Y%m%d-%H%M%S').log"
   {
     printf 'KiQuai diagnostic report\n'
-    printf 'generated=%s\nscript_version=%s\nstage=%s\nmodule=%s\nsource=%s\nline=%s\nfunction=%s\ncommand=%s\n\n' \
+    printf 'generated=%s\nscript_version=%s\nstage=%s\nmodule=%s\nsource=%s\nline=%s\nfunction=%s\ncaller_source=%s\ncaller_line=%s\ncaller_function=%s\ncommand=%s\n\n' \
       "$(timestamp)" "${SCRIPT_VERSION}" "${CURRENT_STAGE}" \
       "${LAST_ERROR_MODULE:-}" "${LAST_ERROR_SOURCE:-}" "${LAST_ERROR_LINE:-}" \
-      "${LAST_ERROR_FUNCTION:-}" "${LAST_ERROR_COMMAND:-}"
+      "${LAST_ERROR_FUNCTION:-}" "${LAST_ERROR_CALLER_SOURCE:-}" \
+      "${LAST_ERROR_CALLER_LINE:-}" "${LAST_ERROR_CALLER_FUNCTION:-}" \
+      "${LAST_ERROR_COMMAND:-}"
     printf '===== OS =====\n'
     uname -a
     [[ -r /etc/os-release ]] && sed -n '1,40p' /etc/os-release
@@ -92,8 +94,40 @@ Configuration summary (secrets redacted):
 EOF
 }
 
+_print_credentials_body() {
+  cat <<EOF
+
+======================================================================
+HASHTOPOLIS CREDENTIALS
+======================================================================
+URL            : ${PUBLIC_URL}
+Admin username : ${HASHTOPOLIS_ADMIN_USER}
+Admin password : ${HASHTOPOLIS_ADMIN_PASSWORD}
+Stored in      : ${ENV_FILE} (mode 600)
+
+This credential block is written directly to the operator console and is not
+copied into loader.log or bootstrap.log.
+EOF
+}
+
+print_credentials_to_console() {
+  if [[ "${KIQUAI_CONSOLE_FD:-}" == "3" && -e /proc/self/fd/3 ]]; then
+    _print_credentials_body >&3
+  else
+    warn "The private console descriptor is unavailable; credential output may be captured by the caller."
+    _print_credentials_body
+  fi
+}
+
 print_success() {
-  supervisor_ctl status
+  local program
+  local state
+  for program in mysql backend nginx; do
+    state="$(supervisor_program_state "${program}")"
+    [[ "${state}" == "RUNNING" ]] \
+      || die "Required Supervisor program '${program}' is ${state:-unknown}, not RUNNING."
+  done
+  supervisor_ctl status || true
   printf '\n%s' "${C_GREEN}"
   print_rule
   printf '%sDEPLOYMENT COMPLETE%s\n' "${C_BOLD}" "${C_RESET}${C_GREEN}"
@@ -101,8 +135,6 @@ print_success() {
   printf '%s' "${C_RESET}"
   cat <<EOF
 Hashtopolis URL : ${PUBLIC_URL}
-Admin username  : ${HASHTOPOLIS_ADMIN_USER}
-Admin password  : ${HASHTOPOLIS_ADMIN_PASSWORD}
 API v2          : ${PUBLIC_URL}/api/v2
 Legacy agent API: ${PUBLIC_URL}/api/server.php
 
@@ -114,11 +146,13 @@ Useful commands:
   $(realpath "$0") status
   $(realpath "$0") logs
   $(realpath "$0") diagnostics
+  $(realpath "$0") credentials
   $(realpath "$0") agent-start YOUR_VOUCHER
 
 Security notice: traffic is plain HTTP unless PUBLIC_URL is provided through a
 trusted HTTPS reverse proxy or tunnel. Use Hashtopolis only for authorized work.
 EOF
+  print_credentials_to_console
 }
 
 require_existing_installation() {
@@ -138,6 +172,7 @@ Usage:
   ./run.sh status                  Show service, HTTP, database, and GPU status
   ./run.sh logs                    Print bounded service logs
   ./run.sh diagnostics             Create a diagnostic report
+  ./run.sh credentials             Print saved admin credentials to console only
   ./run.sh stop                    Stop all managed processes; preserve data
   ./run.sh restart                 Reconcile and restart the managed services
   ./run.sh agent-start VOUCHER     Register/start the local GPU agent
@@ -161,7 +196,7 @@ command_preflight() {
 command_status() {
   require_existing_installation
   if supervisor_is_running; then
-    supervisor_ctl status
+    supervisor_ctl status || true
   else
     error "KiQuai supervisord is not running."
   fi
@@ -179,6 +214,23 @@ command_status() {
   nvidia-smi --query-gpu=index,name,driver_version,memory.total,utilization.gpu \
     --format=csv,noheader 2>/dev/null || true
   hashcat -I 2>/dev/null | sed -n '1,100p' || true
+}
+
+command_credentials() {
+  local saved_user=""
+  local saved_password=""
+  local saved_url=""
+  [[ -r "${ENV_FILE}" ]] \
+    || die "No saved credentials exist at ${ENV_FILE}; run './run.sh deploy' first."
+  saved_user="$(dotenv_get HASHTOPOLIS_ADMIN_USER "${ENV_FILE}" 2>/dev/null || true)"
+  saved_password="$(dotenv_get HASHTOPOLIS_ADMIN_PASSWORD "${ENV_FILE}" 2>/dev/null || true)"
+  saved_url="$(dotenv_get PUBLIC_URL "${ENV_FILE}" 2>/dev/null || true)"
+  [[ -n "${saved_user}" && -n "${saved_password}" ]] \
+    || die "Saved admin credentials are incomplete in ${ENV_FILE}."
+  HASHTOPOLIS_ADMIN_USER="${saved_user}"
+  HASHTOPOLIS_ADMIN_PASSWORD="${saved_password}"
+  [[ -z "${saved_url}" ]] || PUBLIC_URL="${saved_url}"
+  print_credentials_to_console
 }
 
 command_logs() {
@@ -307,7 +359,7 @@ main() {
       usage
       return 0
       ;;
-    deploy|preflight|status|logs|diagnostics|stop|restart|agent-start|agent-stop)
+    deploy|preflight|status|logs|diagnostics|credentials|stop|restart|agent-start|agent-stop)
       ;;
     *)
       usage >&2
@@ -334,6 +386,7 @@ main() {
     status) command_status ;;
     logs) command_logs ;;
     diagnostics) command_diagnostics ;;
+    credentials) command_credentials ;;
     stop) command_stop ;;
     restart)
       deploy

@@ -2,7 +2,7 @@
 # shellcheck shell=bash
 # KiQuai module: releases
 # kiquai-module-api: 1
-# kiquai-release: 3.1.0
+# kiquai-release: 3.1.1
 
 if [[ "${KIQUAI_MODULE_CONTEXT:-0}" != "1" ]]; then
   printf 'This file is a KiQuai module; run ../run.sh instead.\n' >&2
@@ -113,4 +113,3 @@ build_frontend_release() {
   atomic_symlink "${target}" "${FRONTEND_CURRENT}"
   rm -rf -- "${backup}"
 }
-

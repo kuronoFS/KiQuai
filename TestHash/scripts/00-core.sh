@@ -2,7 +2,7 @@
 # shellcheck shell=bash
 # KiQuai module: core
 # kiquai-module-api: 1
-# kiquai-release: 3.1.0
+# kiquai-release: 3.1.1
 
 set -Eeuo pipefail
 shopt -s inherit_errexit 2>/dev/null || true
@@ -25,7 +25,7 @@ fi
 # This script intentionally does not install or start Docker, dockerd, Compose,
 # containerd, a nested network namespace, or a socat port forwarder.
 
-readonly SCRIPT_VERSION="3.1.0"
+readonly SCRIPT_VERSION="3.1.1"
 readonly SCRIPT_NAME="KiQuai Hashtopolis modular single-container bootstrap"
 readonly TOTAL_STEPS=10
 
@@ -119,6 +119,9 @@ LAST_ERROR_MODULE=""
 LAST_ERROR_SOURCE=""
 LAST_ERROR_LINE=""
 LAST_ERROR_FUNCTION=""
+LAST_ERROR_CALLER_SOURCE=""
+LAST_ERROR_CALLER_LINE=""
+LAST_ERROR_CALLER_FUNCTION=""
 LAST_ERROR_COMMAND=""
 LAST_ERROR_MESSAGE=""
 LAST_DIAGNOSTIC_FILE=""
@@ -210,6 +213,9 @@ die() {
   LAST_ERROR_MODULE="${LAST_ERROR_SOURCE##*/}"
   LAST_ERROR_LINE="${BASH_LINENO[0]:-unknown}"
   LAST_ERROR_FUNCTION="${FUNCNAME[1]:-unknown}"
+  LAST_ERROR_CALLER_SOURCE=""
+  LAST_ERROR_CALLER_LINE=""
+  LAST_ERROR_CALLER_FUNCTION=""
   LAST_ERROR_COMMAND="die: $*"
   error "$*"
   exit 1
@@ -221,11 +227,17 @@ record_error() {
   local command="$3"
   local source="$4"
   local function_name="$5"
+  local caller_source="$6"
+  local caller_line="$7"
+  local caller_function="$8"
   LAST_ERROR_CODE="${code}"
   LAST_ERROR_SOURCE="${source}"
   LAST_ERROR_MODULE="${source##*/}"
   LAST_ERROR_LINE="${line}"
   LAST_ERROR_FUNCTION="${function_name}"
+  LAST_ERROR_CALLER_SOURCE="${caller_source}"
+  LAST_ERROR_CALLER_LINE="${caller_line}"
+  LAST_ERROR_CALLER_FUNCTION="${caller_function}"
   LAST_ERROR_COMMAND="${command}"
   return 0
 }
@@ -266,6 +278,11 @@ on_exit() {
     [[ -n "${LAST_ERROR_SOURCE}" ]] && printf 'Source : %s\n' "${LAST_ERROR_SOURCE}" >&2
     [[ -n "${LAST_ERROR_LINE}" ]] && printf 'Line   : %s\n' "${LAST_ERROR_LINE}" >&2
     [[ -n "${LAST_ERROR_FUNCTION}" ]] && printf 'Function: %s\n' "${LAST_ERROR_FUNCTION}" >&2
+    if [[ -n "${LAST_ERROR_CALLER_SOURCE}" && "${LAST_ERROR_CALLER_SOURCE}" != "${LAST_ERROR_SOURCE}" ]]; then
+      printf 'Caller  : %s:%s (%s)\n' \
+        "${LAST_ERROR_CALLER_SOURCE}" "${LAST_ERROR_CALLER_LINE:-unknown}" \
+        "${LAST_ERROR_CALLER_FUNCTION:-unknown}" >&2
+    fi
     [[ -n "${LAST_ERROR_COMMAND}" ]] && printf 'Command: %s\n' "${LAST_ERROR_COMMAND}" >&2
     printf 'Log    : %s\n' "${MAIN_LOG}" >&2
     printf 'Loader : %s\n' "${KIQUAI_LOADER_LOG:-not configured}" >&2
@@ -293,7 +310,7 @@ init_logging() {
 }
 
 install_traps() {
-  trap 'record_error "$?" "$LINENO" "$BASH_COMMAND" "${BASH_SOURCE[0]:-unknown}" "${FUNCNAME[0]:-main}"' ERR
+  trap 'record_error "$?" "$LINENO" "$BASH_COMMAND" "${BASH_SOURCE[0]:-unknown}" "${FUNCNAME[0]:-main}" "${BASH_SOURCE[1]:-}" "${BASH_LINENO[0]:-}" "${FUNCNAME[1]:-}"' ERR
   trap 'on_exit "$?"' EXIT
   trap 'on_signal INT' INT
   trap 'on_signal TERM' TERM

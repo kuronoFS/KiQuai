@@ -2,7 +2,7 @@
 # shellcheck shell=bash
 # KiQuai module: services
 # kiquai-module-api: 1
-# kiquai-release: 3.1.0
+# kiquai-release: 3.1.1
 
 if [[ "${KIQUAI_MODULE_CONTEXT:-0}" != "1" ]]; then
   printf 'This file is a KiQuai module; run ../run.sh instead.\n' >&2
@@ -91,9 +91,100 @@ SQL
   success "Local MySQL database and application account are ready."
 }
 
+supervisor_program_state() {
+  local program="$1"
+  local output=""
+  output="$(supervisor_ctl status "${program}" 2>/dev/null || true)"
+  awk 'NR == 1 { print $2 }' <<< "${output}"
+}
+
+wait_for_supervisor_running() {
+  local program="$1"
+  local timeout="$2"
+  local deadline=$((SECONDS + timeout))
+  local state=""
+
+  while (( SECONDS < deadline )); do
+    state="$(supervisor_program_state "${program}")"
+    case "${state}" in
+      RUNNING)
+        return 0
+        ;;
+      FATAL)
+        return 1
+        ;;
+    esac
+    sleep 1
+  done
+  return 1
+}
+
+restart_or_start_supervisor_program() {
+  local program="$1"
+  local timeout="$2"
+  local state=""
+  local output=""
+  local deadline
+
+  state="$(supervisor_program_state "${program}")"
+  info "Reconciling Supervisor program '${program}' (state=${state:-unknown})."
+
+  case "${state}" in
+    RUNNING|STARTING|BACKOFF|STOPPING)
+      supervisor_ctl stop "${program}" >/dev/null 2>&1 || true
+      deadline=$((SECONDS + 45))
+      while (( SECONDS < deadline )); do
+        state="$(supervisor_program_state "${program}")"
+        case "${state}" in
+          STOPPED|EXITED|FATAL|"")
+            break
+            ;;
+        esac
+        sleep 1
+      done
+      ;;
+  esac
+
+  state="$(supervisor_program_state "${program}")"
+  case "${state}" in
+    RUNNING)
+      success "Supervisor program '${program}' is running."
+      return 0
+      ;;
+    STARTING|BACKOFF|STOPPING)
+      supervisor_ctl status "${program}" || true
+      die "Supervisor program '${program}' did not reach a restartable stopped state."
+      ;;
+  esac
+
+  if ! output="$(supervisor_ctl start "${program}" 2>&1)"; then
+    state="$(supervisor_program_state "${program}")"
+    if [[ "${state}" != "RUNNING" && "${state}" != "STARTING" ]]; then
+      [[ -n "${output}" ]] && printf '%s\n' "${output}" >&2
+      supervisor_ctl status "${program}" || true
+      die "Supervisor could not start '${program}'."
+    fi
+  fi
+
+  if ! wait_for_supervisor_running "${program}" "${timeout}"; then
+    supervisor_ctl status "${program}" || true
+    case "${program}" in
+      backend)
+        tail -n 160 "${LOG_DIR}/backend.log" 2>/dev/null || true
+        tail -n 120 "${LOG_DIR}/apache-error.log" 2>/dev/null || true
+        ;;
+      nginx)
+        tail -n 120 "${LOG_DIR}/nginx-error.log" 2>/dev/null || true
+        ;;
+    esac
+    die "Supervisor program '${program}' did not reach RUNNING within ${timeout} seconds."
+  fi
+  success "Supervisor program '${program}' is running."
+}
+
 restart_web_services() {
-  supervisor_ctl restart backend >/dev/null
-  supervisor_ctl restart nginx >/dev/null
+  restart_or_start_supervisor_program backend 180
+  restart_or_start_supervisor_program nginx 90
 }
 
 wait_for_http() {
@@ -168,4 +259,3 @@ reconcile_agent_process() {
     info "Agent is installed but not registered. Use './run.sh agent-start VOUCHER'."
   fi
 }
-

@@ -2,7 +2,7 @@
 # shellcheck shell=bash
 # KiQuai module: config
 # kiquai-module-api: 1
-# kiquai-release: 3.1.0
+# kiquai-release: 3.1.1
 
 if [[ "${KIQUAI_MODULE_CONTEXT:-0}" != "1" ]]; then
   printf 'This file is a KiQuai module; run ../run.sh instead.\n' >&2
@@ -57,6 +57,10 @@ write_apache_config() {
   cat > /etc/apache2/ports.conf <<EOF
 Listen 127.0.0.1:${BACKEND_PORT}
 EOF
+  cat > /etc/apache2/conf-available/kiquai-servername.conf <<'EOF'
+ServerName 127.0.0.1
+EOF
+  a2enconf kiquai-servername >/dev/null
   a2dissite 000-default.conf >/dev/null 2>&1 || true
   cat > /etc/apache2/sites-available/kiquai-hashtopolis.conf <<EOF
 <VirtualHost 127.0.0.1:${BACKEND_PORT}>
@@ -392,4 +396,3 @@ write_runtime_configs() {
   write_agent_launcher
   write_supervisor_config
 }
-
