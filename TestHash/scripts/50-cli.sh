@@ -2,7 +2,7 @@
 # shellcheck shell=bash
 # KiQuai module: cli
 # kiquai-module-api: 1
-# kiquai-release: 3.2.0
+# kiquai-release: 3.2.1
 
 if [[ "${KIQUAI_MODULE_CONTEXT:-0}" != "1" ]]; then
   printf 'This file is a KiQuai module; run ../run.sh instead.\n' >&2
@@ -41,6 +41,14 @@ collect_diagnostics() {
     printf '===== OS =====\n'
     uname -a
     [[ -r /etc/os-release ]] && sed -n '1,40p' /etc/os-release
+    printf '\n===== Outer container lifecycle =====\n'
+    printf 'script_pid=%s\nscript_ppid=%s\n' "$$" "${PPID}"
+    printf 'pid1_name='
+    cat /proc/1/comm 2>/dev/null || printf 'unknown\n'
+    printf 'pid1_start_ticks='
+    awk '{print $22}' /proc/1/stat 2>/dev/null || printf 'unknown\n'
+    printf 'intentional_stop_marker=%s\n' "$([[ -f "${SERVE_STOP_MARKER}" ]] && printf present || printf absent)"
+    [[ ! -r "${SUPERVISOR_PID}" ]] || printf 'supervisor_pid=%s\n' "$(<"${SUPERVISOR_PID}")"
     printf '\n===== Disk and memory =====\n'
     df -h "$(dirname "${APP_DIR}")" 2>&1 || true
     free -h 2>&1 || true
@@ -121,16 +129,18 @@ Admin password : ${HASHTOPOLIS_ADMIN_PASSWORD}
 Stored in      : ${ENV_FILE} (mode 600)
 
 This credential block is written directly to the operator console and is not
-copied into loader.log or bootstrap.log.
+copied into loader.log or bootstrap.log. Your terminal or platform may still
+retain console output; close the session after use and never attach it to a log.
 EOF
 }
 
 print_credentials_to_console() {
-  if [[ "${KIQUAI_CONSOLE_FD:-}" == "3" && -e /proc/self/fd/3 ]]; then
+  if [[ "${KIQUAI_CONSOLE_FD:-}" == "3" && -e /proc/self/fd/3 && -t 3 ]]; then
     _print_credentials_body >&3
-  else
-    warn "The private console descriptor is unavailable; credential output may be captured by the caller."
+  elif [[ -t 1 ]]; then
     _print_credentials_body
+  else
+    die "Refusing to print the admin password to non-interactive output. Run './run.sh credentials' from an interactive SSH/terminal session, or inspect ${ENV_FILE} locally."
   fi
 }
 
@@ -173,8 +183,10 @@ Useful commands:
 
 Security notice: traffic is plain HTTP unless PUBLIC_URL is provided through a
 trusted HTTPS reverse proxy or tunnel. Use Hashtopolis only for authorized work.
+
+The admin password is not printed during deploy/serve. Retrieve it explicitly
+from an interactive terminal with: $(realpath "$0") credentials
 EOF
-  print_credentials_to_console
 }
 
 require_existing_installation() {
@@ -187,8 +199,9 @@ usage() {
 ${SCRIPT_NAME} v${SCRIPT_VERSION}
 
 Usage:
-  ./run.sh                         Deploy or reconcile everything
-  ./run.sh deploy                  Same as above
+  ./run.sh                         TTY: deploy once; non-TTY startup: serve
+  ./run.sh deploy                  Deploy or reconcile, then return
+  ./run.sh serve                   Deploy, then keep the outer container alive
   ./run.sh verify-modules          Download and validate every module only
   ./run.sh preflight               Check root, disk, and NVIDIA visibility
   ./run.sh status                  Show service, HTTP, database, and GPU status
@@ -202,11 +215,11 @@ Usage:
   ./run.sh help                    Show this help
 
 Common overrides:
-  PUBLIC_URL=http://IP:PORT ./run.sh
-  APP_DIR=/data/kiquai-hashtopolis ./run.sh
-  FORCE_REBUILD=1 ./run.sh
-  WIPE_DATA=1 ./run.sh
-  REQUIRE_HASHCAT_GPU=0 ./run.sh
+  PUBLIC_URL=http://IP:PORT ./run.sh deploy
+  APP_DIR=/data/kiquai-hashtopolis ./run.sh deploy
+  FORCE_REBUILD=1 ./run.sh deploy
+  WIPE_DATA=1 ./run.sh deploy
+  REQUIRE_HASHCAT_GPU=0 ./run.sh deploy
 EOF
 }
 
@@ -316,8 +329,91 @@ command_diagnostics() {
 command_stop() {
   require_existing_installation
   acquire_lock
+  printf 'run=%s requested=%s\n' "${RUN_ID}" "$(timestamp)" \
+    > "${SERVE_STOP_MARKER}.tmp.$$"
+  chmod 600 "${SERVE_STOP_MARKER}.tmp.$$"
+  mv -f "${SERVE_STOP_MARKER}.tmp.$$" "${SERVE_STOP_MARKER}"
   stop_managed_services
-  success "All KiQuai services stopped. Database and files were preserved."
+  success "All KiQuai services stopped intentionally. The foreground keeper, if active, remains available; database and files were preserved."
+}
+
+acquire_serve_lock() {
+  mkdir -p "$(dirname "${LOCK_FILE}")"
+  exec 7>"${LOCK_FILE}.serve"
+  if ! flock -n 7; then
+    exec 7>&-
+    die "Another KiQuai serve process is already monitoring this installation."
+  fi
+}
+
+serve_request_shutdown() {
+  local signal="$1"
+  if [[ "${SERVE_SHUTDOWN_REQUESTED:-0}" == "1" ]]; then
+    return 0
+  fi
+  SERVE_SHUTDOWN_REQUESTED=1
+  SERVE_SHUTDOWN_DEADLINE=$((SECONDS + 90))
+  warn "Foreground service mode received ${signal}; requesting a clean Supervisor shutdown."
+  if supervisor_is_running && ! supervisor_ctl shutdown >/dev/null 2>&1; then
+    warn "Supervisor did not accept the shutdown request; waiting for the outer runtime to stop it."
+  fi
+}
+
+serve_ignore_hup() {
+  warn "Foreground service mode ignored HUP; use TERM or INT for a clean shutdown."
+}
+
+monitor_supervisor_foreground() {
+  local supervisor_pid=""
+  local pid1_name="unknown"
+  local pid1_start_ticks="unknown"
+  local intentional_stop_logged=0
+
+  supervisor_is_running \
+    || die "Cannot enter foreground service mode because KiQuai supervisord is not running."
+  supervisor_pid="$(<"${SUPERVISOR_PID}")"
+  [[ ! -r /proc/1/comm ]] || pid1_name="$(</proc/1/comm)"
+  [[ ! -r /proc/1/stat ]] \
+    || pid1_start_ticks="$(awk '{print $22}' /proc/1/stat 2>/dev/null || printf 'unknown')"
+
+  CURRENT_STAGE="serve:foreground-monitor"
+  DEPLOYMENT_COMPLETE=0
+  SERVE_SHUTDOWN_REQUESTED=0
+  SERVE_SHUTDOWN_DEADLINE=0
+  trap 'serve_request_shutdown INT' INT
+  trap 'serve_request_shutdown TERM' TERM
+  trap 'serve_ignore_hup' HUP
+
+  success "Foreground service mode is active (keeper_pid=$$, supervisor_pid=${supervisor_pid}, pid1=${pid1_name}, pid1_start_ticks=${pid1_start_ticks})."
+  info "The operation lock was released; status/logs/diagnostics remain available from another terminal."
+
+  while :; do
+    if supervisor_is_running; then
+      if [[ "${SERVE_SHUTDOWN_REQUESTED}" == "1" ]] \
+          && (( SECONDS >= SERVE_SHUTDOWN_DEADLINE )); then
+        die "KiQuai supervisord did not stop within 90 seconds after the shutdown signal."
+      fi
+      intentional_stop_logged=0
+    elif [[ "${SERVE_SHUTDOWN_REQUESTED}" == "1" ]]; then
+      success "KiQuai Supervisor and all managed processes stopped cleanly."
+      return 0
+    elif [[ -f "${SERVE_STOP_MARKER}" ]]; then
+      if [[ "${intentional_stop_logged}" == "0" ]]; then
+        warn "Managed services were stopped intentionally; foreground keeper remains active. Run './run.sh restart' to reconcile them or stop the Vast instance to end the container."
+        intentional_stop_logged=1
+      fi
+    else
+      die "KiQuai supervisord exited unexpectedly while foreground service mode was active."
+    fi
+    sleep 2 || true
+  done
+}
+
+command_serve() {
+  acquire_serve_lock
+  deploy
+  release_lock
+  monitor_supervisor_foreground
 }
 
 command_agent_start() {
@@ -383,6 +479,7 @@ deploy() {
   begin_step "Prepare persistent single-container layout"
   wipe_data_if_requested
   prepare_layout
+  rm -f "${SERVE_STOP_MARKER}"
   stop_legacy_dind_runtime
   archive_legacy_dind_config
   validate_service_ports
@@ -434,14 +531,30 @@ deploy() {
   DEPLOYMENT_COMPLETE=1
 }
 
+resolve_cli_command() {
+  local requested="${1-}"
+  if [[ -n "${requested}" ]]; then
+    printf '%s\n' "${requested}"
+    return 0
+  fi
+  if [[ -t 0 ]] && {
+      [[ "${KIQUAI_CONSOLE_FD:-}" == "3" && -t 3 ]] || [[ -t 1 ]];
+    }; then
+    printf 'deploy\n'
+  else
+    printf 'serve\n'
+  fi
+}
+
 main() {
-  local command="${1:-deploy}"
+  local command=""
+  command="$(resolve_cli_command "${1-}")"
   case "${command}" in
     help|-h|--help)
       usage
       return 0
       ;;
-    deploy|preflight|status|logs|diagnostics|credentials|stop|restart|agent-start|agent-stop)
+    deploy|serve|preflight|status|logs|diagnostics|credentials|stop|restart|agent-start|agent-stop)
       ;;
     *)
       usage >&2
@@ -467,6 +580,7 @@ main() {
 
   case "${command}" in
     deploy) deploy ;;
+    serve) command_serve ;;
     preflight) command_preflight ;;
     status) command_status ;;
     logs) command_logs ;;

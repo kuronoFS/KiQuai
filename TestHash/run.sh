@@ -5,8 +5,9 @@ set -Eeuo pipefail
 shopt -s inherit_errexit 2>/dev/null || true
 umask 077
 
-# Preserve the caller's original stdout. Credential output uses fd 3 so secrets
-# remain visible to the operator without being copied into loader/bootstrap logs.
+# Preserve the caller's original stdout. The explicit `credentials` command uses
+# fd 3 only when it is attached to an interactive terminal; deploy/serve never
+# print the admin password automatically.
 exec 3>&1
 readonly KIQUAI_CONSOLE_FD=3
 export KIQUAI_CONSOLE_FD
@@ -14,7 +15,7 @@ export KIQUAI_CONSOLE_FD
 # This file is intentionally small. It downloads, validates, caches, and loads
 # the version-matched scripts listed in scripts/manifest.sha256.
 
-readonly KIQUAI_LOADER_VERSION="3.2.0"
+readonly KIQUAI_LOADER_VERSION="3.2.1"
 readonly KIQUAI_MODULE_API="1"
 readonly -a KIQUAI_MODULES=(
   "00-core.sh"

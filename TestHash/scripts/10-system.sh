@@ -2,7 +2,7 @@
 # shellcheck shell=bash
 # KiQuai module: system
 # kiquai-module-api: 1
-# kiquai-release: 3.2.0
+# kiquai-release: 3.2.1
 
 if [[ "${KIQUAI_MODULE_CONTEXT:-0}" != "1" ]]; then
   printf 'This file is a KiQuai module; run ../run.sh instead.\n' >&2
@@ -11,9 +11,22 @@ fi
 
 acquire_lock() {
   have_cmd flock || die "Required command 'flock' is missing; install util-linux first."
+  [[ "${OPERATION_LOCK_HELD}" == "0" ]] \
+    || die "The current KiQuai process already holds the operation lock."
   mkdir -p "$(dirname "${LOCK_FILE}")"
   exec 9>"${LOCK_FILE}"
-  flock -n 9 || die "Another KiQuai operation is already running."
+  if ! flock -n 9; then
+    exec 9>&-
+    die "Another KiQuai operation is already running."
+  fi
+  OPERATION_LOCK_HELD=1
+}
+
+release_lock() {
+  [[ "${OPERATION_LOCK_HELD}" == "1" ]] || return 0
+  flock -u 9 2>/dev/null || true
+  exec 9>&-
+  OPERATION_LOCK_HELD=0
 }
 
 print_header() {

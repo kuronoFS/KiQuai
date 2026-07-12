@@ -2,7 +2,7 @@
 # shellcheck shell=bash
 # KiQuai module: core
 # kiquai-module-api: 1
-# kiquai-release: 3.2.0
+# kiquai-release: 3.2.1
 
 set -Eeuo pipefail
 shopt -s inherit_errexit 2>/dev/null || true
@@ -25,7 +25,7 @@ fi
 # This script intentionally does not install or start Docker, dockerd, Compose,
 # containerd, a nested network namespace, or a socat port forwarder.
 
-readonly SCRIPT_VERSION="3.2.0"
+readonly SCRIPT_VERSION="3.2.1"
 readonly SCRIPT_NAME="KiQuai Hashtopolis modular single-container bootstrap"
 readonly TOTAL_STEPS=10
 readonly SQLX_CLI_VERSION="0.9.0"
@@ -113,6 +113,7 @@ NGINX_CONFIG=""
 RUNTIME_ENV_FILE=""
 BACKEND_READY_FILE=""
 MIGRATION_LOG=""
+SERVE_STOP_MARKER=""
 SERVER_RELEASE_TARGET=""
 FRONTEND_RELEASE_TARGET=""
 
@@ -134,6 +135,7 @@ LAST_ERROR_COMMAND=""
 LAST_ERROR_MESSAGE=""
 LAST_DIAGNOSTIC_FILE=""
 POLICY_RC_CREATED=0
+OPERATION_LOCK_HELD=0
 CURRENT_MODULE="00-core.sh"
 
 if [[ -t 1 || "${FORCE_COLOR}" == "1" ]] && [[ -z "${NO_COLOR-}" ]]; then
@@ -277,7 +279,8 @@ on_exit() {
   if (( code != 0 )); then
     printf '\n%s' "${C_RED}" >&2
     printf '%s\n' '!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!' >&2
-    if [[ "${CURRENT_COMMAND}" == "deploy" || "${CURRENT_COMMAND}" == "restart" ]]; then
+    if [[ "${CURRENT_COMMAND}" == "deploy" || "${CURRENT_COMMAND}" == "restart" \
+        || "${CURRENT_COMMAND}" == "serve" ]]; then
       printf 'DEPLOYMENT FAILED (exit=%s, stage=%s)\n' "${code}" "${CURRENT_STAGE}" >&2
     else
       printf 'COMMAND FAILED (command=%s, exit=%s, stage=%s)\n' \
@@ -310,6 +313,8 @@ on_exit() {
 }
 
 init_logging() {
+  local pid1_name="unknown"
+  local pid1_start_ticks="unknown"
   mkdir -p "${LOG_DIR}"
   # Service log files have their own restrictive modes. The directory needs
   # execute-only traversal for the mysql user.
@@ -320,8 +325,12 @@ init_logging() {
   touch "${MAIN_LOG}"
   chmod 600 "${MAIN_LOG}"
   exec > >(tee -a "${MAIN_LOG}") 2>&1
-  printf '\n[%s] ===== KiQuai run start: run=%s command=%s version=%s pid=%s =====\n' \
-    "$(timestamp)" "${RUN_ID}" "${CURRENT_COMMAND}" "${SCRIPT_VERSION}" "$$"
+  [[ ! -r /proc/1/comm ]] || pid1_name="$(</proc/1/comm)"
+  [[ ! -r /proc/1/stat ]] \
+    || pid1_start_ticks="$(awk '{print $22}' /proc/1/stat 2>/dev/null || printf 'unknown')"
+  printf '\n[%s] ===== KiQuai run start: run=%s command=%s version=%s pid=%s ppid=%s pid1=%s pid1_start_ticks=%s =====\n' \
+    "$(timestamp)" "${RUN_ID}" "${CURRENT_COMMAND}" "${SCRIPT_VERSION}" \
+    "$$" "${PPID}" "${pid1_name}" "${pid1_start_ticks}"
 }
 
 install_traps() {
@@ -492,6 +501,7 @@ apply_defaults() {
   RUNTIME_ENV_FILE="${CONFIG_DIR}/runtime-env.sh"
   BACKEND_READY_FILE="${RUN_DIR}/backend-ready"
   MIGRATION_LOG="${LOG_DIR}/migration.log"
+  SERVE_STOP_MARKER="${RUN_DIR}/serve-services-stopped"
 }
 
 resolve_public_url() {

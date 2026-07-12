@@ -1,6 +1,6 @@
 # KiQuai Hashtopolis + Hashcat trên Vast.ai
 
-KiQuai triển khai toàn bộ stack trực tiếp trong **một CUDA container gốc của Vast.ai**. `run.sh` 3.2.0 chỉ là loader nhỏ: tải manifest và sáu module, kiểm tra từng file rồi mới nạp logic triển khai. Stack không cài Docker Engine, không khởi động `dockerd`, không dùng Docker Compose, không tạo nested container, bridge network hay `socat`.
+KiQuai triển khai toàn bộ stack trực tiếp trong **một CUDA container gốc của Vast.ai**. `run.sh` 3.2.1 chỉ là loader nhỏ: tải manifest và sáu module, kiểm tra từng file rồi mới nạp logic triển khai. Stack không cài Docker Engine, không khởi động `dockerd`, không dùng Docker Compose, không tạo nested container, bridge network hay `socat`.
 
 Các process MySQL, Apache/PHP, Nginx và Hashtopolis Python Agent được quản lý bởi một `supervisord` riêng. Hashcat chạy trực tiếp trong cùng container để sử dụng GPU NVIDIA do Vast.ai gắn vào container đó.
 
@@ -29,7 +29,7 @@ Tất cả node trong sơ đồ đều là process hoặc file nằm trong cùng
 | Python agent | Không mở port | Không |
 | Hashcat | Không phải daemon | Không |
 
-`supervisord` dùng socket riêng trong `APP_DIR/run/`; nó không thay thế supervisor hoặc entrypoint do image/Vast.ai cung cấp.
+`supervisord` dùng socket riêng trong `APP_DIR/run/`. Lệnh `serve` giữ một foreground keeper theo dõi đúng PID Supervisor để workload/entrypoint không kết thúc; Supervisor vẫn dùng socket và PID file riêng, không giả mạo supervisor của Vast.ai.
 
 ### Kiến trúc bootstrap module
 
@@ -38,7 +38,7 @@ flowchart LR
     Run["run.sh loader"] --> Manifest["scripts/manifest.sha256"]
     Manifest --> Download["Tải 6 module"]
     Download --> Verify["Release/API + SHA-256 + bash -n"]
-    Verify --> Cache["Atomic cache APP_DIR/bootstrap/3.2.0"]
+    Verify --> Cache["Atomic cache APP_DIR/bootstrap/3.2.1"]
     Offline["Mạng lỗi / lệnh cứu hộ"] --> Cache
     Cache --> Source["Source theo thứ tự"]
     Source --> Deploy["main → 10 deployment stages"]
@@ -71,7 +71,7 @@ TestHash/
 | `40-services.sh` | MySQL provisioning, one-shot migration, HTTP contract check và Python agent |
 | `50-cli.sh` | Diagnostics, command dispatch và 10 deployment stages |
 
-Loader không source một module nếu thiếu file, sai checksum, sai module API/release hoặc không qua `bash -n`. Module đã xác minh được publish nguyên thư mục dưới lock tại `APP_DIR/bootstrap/3.2.0/`. Các lệnh vận hành như `status`, `logs`, `diagnostics`, `stop` và `help` ưu tiên cache đã xác minh nên vẫn dùng được khi GitHub tạm thời mất kết nối.
+Loader không source một module nếu thiếu file, sai checksum, sai module API/release hoặc không qua `bash -n`. Module đã xác minh được publish nguyên thư mục dưới lock tại `APP_DIR/bootstrap/3.2.1/`. Các lệnh vận hành như `status`, `logs`, `diagnostics`, `stop` và `help` ưu tiên cache đã xác minh nên vẫn dùng được khi GitHub tạm thời mất kết nối.
 
 ## Trạng thái hỗ trợ upstream
 
@@ -86,7 +86,7 @@ Phiên bản mặc định:
 
 | Component | Phiên bản |
 |---|---|
-| Bootstrap/module release | `3.2.0` |
+| Bootstrap/module release | `3.2.1` |
 | Hashtopolis backend | `v1.0.0-rc2` |
 | Hashtopolis frontend | `v1.0.0-rc2` |
 | Python agent | Bản do backend cung cấp tại `agents.php?download=1` |
@@ -110,7 +110,7 @@ Script hiện hỗ trợ host `x86_64`.
 
 ### Launch mode
 
-Chọn **SSH**. Jupyter thường sử dụng port nội bộ `8080` và có thể xung đột với Nginx của stack.
+Chọn **SSH**. Jupyter thường sử dụng port nội bộ `8080` và có thể xung đột với Nginx của stack. Nếu chọn **Docker ENTRYPOINT** thay cho SSH, lệnh workload bắt buộc phải kết thúc bằng `exec /root/run.sh serve`; dùng `deploy` one-shot làm workload sẽ khiến PID chính thoát và outer container có thể bị nền tảng relaunch liên tục.
 
 ### Docker Options
 
@@ -134,25 +134,25 @@ Nếu dùng port khác:
 và chạy:
 
 ```bash
-INTERNAL_PORT=18000 ./run.sh
+INTERNAL_PORT=18000 ./run.sh deploy
 ```
 
 ## 2. Download và chạy
 
-> Phải push `run.sh`, `README.md`, `scripts/manifest.sha256` và cả sáu module trong **cùng một commit** trước khi dùng URL GitHub. Nhánh `main` phải thực sự chứa trọn release 3.2.0.
+> Phải push `run.sh`, `README.md`, `scripts/manifest.sha256` và cả sáu module trong **cùng một commit** trước khi dùng URL GitHub. Nhánh `main` phải thực sự chứa trọn release 3.2.1.
 
 Nếu image đã có `curl`, one-liner cho trường **On-start Script** là:
 
 ```bash
-bash -lc 'curl -fsSL https://raw.githubusercontent.com/kuronoFS/KiQuai/refs/heads/main/TestHash/run.sh -o /root/run.sh && chmod 700 /root/run.sh && /root/run.sh'
+bash -lc 'curl -fsSL https://raw.githubusercontent.com/kuronoFS/KiQuai/refs/heads/main/TestHash/run.sh -o /root/run.sh && chmod 700 /root/run.sh && exec /root/run.sh serve'
 ```
 
-Đây là bản rút gọn được khuyến nghị. `run.sh` tự tải và kiểm tra manifest cùng từng module; không cần đưa sáu lệnh `curl` vào one-liner.
+Đây là bản rút gọn được khuyến nghị. `run.sh` tự tải và kiểm tra manifest cùng từng module; không cần đưa sáu lệnh `curl` vào one-liner. `serve` reconcile stack, giải phóng operation lock rồi theo dõi PID Supervisor ở foreground, nên các lệnh `status`, `logs`, `diagnostics` và `agent-start` vẫn chạy được từ terminal khác. Để tương thích one-liner cũ, gọi `run.sh` không tham số trong môi trường non-TTY cũng tự chọn `serve`; trong terminal tương tác nó chọn deploy one-shot.
 
 Nếu image tối giản chưa có `curl`/CA certificate, dùng bản portable:
 
 ```bash
-bash -lc 'apt-get update && apt-get install -y curl ca-certificates && curl -fsSL https://raw.githubusercontent.com/kuronoFS/KiQuai/refs/heads/main/TestHash/run.sh -o /root/run.sh && chmod 700 /root/run.sh && /root/run.sh'
+bash -lc 'apt-get update && apt-get install -y curl ca-certificates && curl -fsSL https://raw.githubusercontent.com/kuronoFS/KiQuai/refs/heads/main/TestHash/run.sh -o /root/run.sh && chmod 700 /root/run.sh && exec /root/run.sh serve'
 ```
 
 Không dùng `curl ... | bash` ở đây: lưu `/root/run.sh` giúp dùng lại cùng entrypoint cho `status`, `logs`, `diagnostics` và các lần reconcile.
@@ -176,7 +176,7 @@ Regression test không cần GPU/MySQL/service thật:
 bash tests/test-shell.sh
 ```
 
-Test kiểm tra `bash -n`, manifest SHA-256, source module dưới `set -u`, generated launcher, Supervisor autostart policy, re-derive `PUBLIC_URL`, failed-migration guard, HTTP contract, thứ tự deploy và cache loader khi offline.
+Test kiểm tra `bash -n`, manifest SHA-256, source module dưới `set -u`, generated launcher, Supervisor autostart policy, re-derive `PUBLIC_URL`, failed-migration guard, HTTP contract, thứ tự deploy, lifecycle `serve`, operation lock và cache loader khi offline.
 
 Preflight:
 
@@ -193,22 +193,22 @@ Preflight chỉ yêu cầu:
 
 Không còn kiểm tra `CAP_SYS_ADMIN`, `CAP_NET_ADMIN`, mount namespace hoặc network namespace vì không còn DinD.
 
-Triển khai:
+Triển khai one-shot từ terminal SSH:
 
 ```bash
-/root/run.sh
+/root/run.sh deploy
 ```
 
 Nên dành tối thiểu 15 GB trống cho lần build đầu. Script hard-fail ở ngưỡng `MIN_FREE_GB=10` theo mặc định.
 
-Nếu muốn các service tự reconcile khi Vast.ai restart container, đặt one-liner rút gọn vào trường **On-start Script** của template SSH.
+Lệnh `deploy` trả về sau khi kiểm tra thành công. Với **On-start Script** hoặc Docker ENTRYPOINT/workload, luôn nên ghi rõ `serve`; lệnh này chỉ trả về khi container nhận TERM/INT hoặc Supervisor chết. TERM/INT được chuyển thành `supervisorctl shutdown`, còn HUP được bỏ qua để tránh đóng stack khi terminal tách phiên. Không tham số chỉ là cơ chế auto-detect tương thích ngược; automation one-shot nên luôn ghi rõ `deploy`.
 
 ### Cố định một revision
 
 `refs/heads/main` là mutable. Để mọi lần chạy dùng đúng cùng bộ file, đặt `KIQUAI_REF` thành full commit SHA và dùng SHA đó trong URL tải loader:
 
 ```bash
-bash -lc 'REF=YOUR_FULL_COMMIT_SHA; curl -fsSL "https://raw.githubusercontent.com/kuronoFS/KiQuai/$REF/TestHash/run.sh" -o /root/run.sh && chmod 700 /root/run.sh && KIQUAI_REF="$REF" /root/run.sh'
+bash -lc 'REF=YOUR_FULL_COMMIT_SHA; curl -fsSL "https://raw.githubusercontent.com/kuronoFS/KiQuai/$REF/TestHash/run.sh" -o /root/run.sh && chmod 700 /root/run.sh && export KIQUAI_REF="$REF" && exec /root/run.sh serve'
 ```
 
 Nếu pin revision qua Vast template, nên đặt thêm `-e KIQUAI_REF=YOUR_FULL_COMMIT_SHA` để các lệnh sau cũng dùng cùng revision. GitHub ghi rõ URL theo branch có thể đổi theo commit mới, còn URL chứa commit ID giữ nguyên nội dung.
@@ -226,18 +226,16 @@ Trước giai đoạn 01/10, loader tải và xác minh toàn bộ module. Sau �
 7. Dừng agent/Nginx/backend, kích hoạt đồng bộ cặp release, sinh và kiểm tra cấu hình, rồi initialize MySQL khi cần.
 8. Chỉ khởi động MySQL, tạo database/user, chặn migration dở, chạy `setup.php` đồng bộ đúng một lần, sau đó mới start backend/Nginx.
 9. Kiểm tra frontend và JSON contract của legacy agent API rồi cài Python agent.
-10. In trạng thái và credential.
+10. In trạng thái và vị trí lưu credential; không in mật khẩu tự động.
 
 Lần đầu có thể mất nhiều thời gian ở bước build `sqlx` và Angular frontend. `sqlx-cli` được pin ở `0.9.0` và Rust ở `1.94.0`; các lần chạy sau chỉ tái sử dụng binary khi exact version khớp.
 
 ## 4. Kết quả
 
-Sau khi thành công, script in URL và trạng thái vào log, sau đó ghi credential trực tiếp ra console của operator:
+Sau khi thành công, `deploy`/`serve` chỉ in URL, trạng thái và lệnh lấy credential; mật khẩu không còn xuất hiện tự động trong container log:
 
 ```text
 Hashtopolis URL : http://PUBLIC_IP:EXTERNAL_PORT
-Admin username  : admin
-Admin password  : RANDOM_PASSWORD
 API v2          : http://PUBLIC_IP:EXTERNAL_PORT/api/v2
 Legacy agent API: http://PUBLIC_IP:EXTERNAL_PORT/api/server.php
 ```
@@ -256,7 +254,7 @@ Xem lại credential bất kỳ lúc nào:
 /root/run.sh credentials
 ```
 
-Output của lệnh `credentials` đi qua console descriptor riêng và không được sao chép vào `loader.log` hoặc `bootstrap.log`. Nếu đang dùng release cũ chưa có command này:
+Lệnh `credentials` chỉ chấp nhận một terminal tương tác. Output đi qua console descriptor riêng và không được sao chép vào `loader.log` hoặc `bootstrap.log`, nhưng terminal hoặc nền tảng vẫn có thể lưu console output; không redirect/pipe lệnh này vào file log. Nếu đang dùng release cũ chưa có command này:
 
 ```bash
 set -a
@@ -298,7 +296,7 @@ Agent package được cài sẵn nhưng mặc định không chạy vì Hashtop
 Hoặc truyền voucher ngay lần deploy đầu:
 
 ```bash
-AGENT_VOUCHER=YOUR_VOUCHER /root/run.sh
+AGENT_VOUCHER=YOUR_VOUCHER /root/run.sh deploy
 ```
 
 Agent kết nối qua loopback:
@@ -334,12 +332,12 @@ Hashtopolis có thể yêu cầu agent tải một Hashcat package riêng cho ta
 | `KIQUAI_REPOSITORY` | `kuronoFS/KiQuai` | Repository chứa `TestHash/` |
 | `KIQUAI_REF` | `refs/heads/main` | Branch, tag hoặc full commit SHA dùng cho manifest và module |
 | `KIQUAI_BASE_URL` | Raw GitHub URL suy ra từ repo/ref | Override nguồn tải; hỗ trợ HTTPS và `file://` để kiểm thử |
-| `KIQUAI_MODULE_DIR` | `APP_DIR/bootstrap/3.2.0` | Cache chỉ chứa module đã xác minh |
+| `KIQUAI_MODULE_DIR` | `APP_DIR/bootstrap/3.2.1` | Cache chỉ chứa module đã xác minh |
 | `KIQUAI_LOADER_LOG` | `LOG_DIR/loader.log` | Log tải, checksum, syntax check và source module |
 | `KIQUAI_REFRESH_MODULES` | `0` | Đặt `1` để buộc lệnh vận hành thử refresh module thay vì ưu tiên cache |
 | `KIQUAI_REQUIRE_FRESH_MODULES` | `0` | Đặt `1` để cấm fallback cache nếu tải mạng thất bại |
 
-Loader yêu cầu `run.sh`, manifest và module có cùng release `3.2.0` và module API `1`. Không trộn file từ hai commit hoặc tự sửa module mà quên cập nhật manifest.
+Loader yêu cầu `run.sh`, manifest và module có cùng release `3.2.1` và module API `1`. Không trộn file từ hai commit hoặc tự sửa module mà quên cập nhật manifest.
 
 `deploy`/`restart` thử tải bộ module mới trước rồi fallback sang cache đã xác minh nếu lỗi mạng. `verify-modules` luôn yêu cầu tải thành công; các lệnh cứu hộ ưu tiên cache để không bị GitHub chặn việc debug hoặc stop service.
 
@@ -361,7 +359,7 @@ Loader yêu cầu `run.sh`, manifest và module có cùng release `3.2.0` và mo
 Nếu `APP_DIR` thay đổi, phải truyền cùng giá trị cho các lệnh sau vì `APP_DIR` quyết định vị trí của chính `.env`:
 
 ```bash
-APP_DIR=/data/kiquai-hashtopolis /root/run.sh
+APP_DIR=/data/kiquai-hashtopolis /root/run.sh deploy
 APP_DIR=/data/kiquai-hashtopolis /root/run.sh status
 APP_DIR=/data/kiquai-hashtopolis /root/run.sh logs
 ```
@@ -401,13 +399,13 @@ Riêng khi caller truyền `PUBLIC_URL` mới, script tự tính lại `HASHTOPO
 Server-only, không bắt buộc GPU Hashcat:
 
 ```bash
-REQUIRE_HASHCAT_GPU=0 /root/run.sh
+REQUIRE_HASHCAT_GPU=0 /root/run.sh deploy
 ```
 
 Rebuild đúng tag:
 
 ```bash
-FORCE_REBUILD=1 /root/run.sh
+FORCE_REBUILD=1 /root/run.sh deploy
 ```
 
 Đổi version phải đổi cả backend và frontend sang cặp tương thích:
@@ -416,7 +414,7 @@ FORCE_REBUILD=1 /root/run.sh
 HASHTOPOLIS_VERSION=vX.Y.Z \
 HASHTOPOLIS_FRONTEND_VERSION=vX.Y.Z \
 FORCE_REBUILD=1 \
-/root/run.sh
+/root/run.sh deploy
 ```
 
 ## 7. Quản trị
@@ -441,7 +439,7 @@ Diagnostic:
 /root/run.sh diagnostics
 ```
 
-Credential quản trị, chỉ in ra console và không ghi vào log:
+Credential quản trị, chỉ cho phép từ terminal tương tác và không ghi vào log ứng dụng:
 
 ```bash
 /root/run.sh credentials
@@ -453,22 +451,24 @@ Stop toàn bộ process được quản lý, giữ data:
 /root/run.sh stop
 ```
 
+Nếu `serve` đang chạy, foreground keeper vẫn sống sau lệnh `stop` để outer container không bị relaunch; chạy `restart` để bật lại stack. Muốn kết thúc cả keeper/container, dùng nút **Stop** của Vast.ai hoặc gửi TERM cho workload `serve`.
+
 Reconcile config và restart web services:
 
 ```bash
 /root/run.sh restart
 ```
 
-Rerun bình thường cũng idempotent:
+Reconcile one-shot cũng idempotent:
 
 ```bash
-/root/run.sh
+/root/run.sh deploy
 ```
 
 Reset hoàn toàn kiến trúc mới:
 
 ```bash
-WIPE_DATA=1 /root/run.sh
+WIPE_DATA=1 /root/run.sh deploy
 ```
 
 `WIPE_DATA=1` xóa database, Hashtopolis files, releases, agent registration và credential trong `APP_DIR`. Log mặc định ở `/var/log/kiquai-hashtopolis` được giữ.
@@ -564,11 +564,31 @@ cd TestHash/scripts
 {
   printf '%s\n' '# KiQuai verified module manifest' \
     '# kiquai-module-api: 1' \
-    '# kiquai-release: 3.2.0'
+    '# kiquai-release: 3.2.1'
   sha256sum 00-core.sh 10-system.sh 20-releases.sh \
     30-config.sh 40-services.sh 50-cli.sh
 } > manifest.sha256
 for file in ./*.sh ../run.sh; do bash -n "$file"; done
+```
+
+### Banner CUDA/APT xuất hiện lặp lại sau `DEPLOYMENT COMPLETE`
+
+Nếu `mysql`, `backend` và `nginx` đều `RUNNING`, HTTP contract đã pass, rồi log lập tức in lại banner `== CUDA ==` và chạy lại `apt-get`, đó là **outer container startup mới**, không phải Supervisor child crash. Nguyên nhân thường gặp là dùng `/root/run.sh deploy` hoặc `/root/run.sh` làm Docker workload/entrypoint: deploy trả exit `0`, PID chính kết thúc và nền tảng đưa instance mong muốn ở trạng thái running lên lại.
+
+Release 3.2.1 cung cấp lifecycle đúng cho trường hợp này:
+
+```bash
+exec /root/run.sh serve
+```
+
+`serve` deploy/reconcile xong sẽ giải phóng operation lock, log `keeper_pid`, `supervisor_pid`, PID 1 name và PID 1 start ticks, sau đó theo dõi Supervisor ở foreground. TERM/INT yêu cầu shutdown sạch; Supervisor biến mất ngoài ý muốn làm `serve` fail rõ ràng; `run.sh stop` được nhận diện là dừng có chủ ý và keeper tiếp tục sống. Trong template Vast.ai, dùng nguyên one-liner `... && exec /root/run.sh serve` ở phần trên.
+
+Kiểm tra ranh giới outer container:
+
+```bash
+ps -p 1 -o pid,ppid,comm,args
+awk '{print $22}' /proc/1/stat
+tail -n 120 /var/log/kiquai-hashtopolis/bootstrap.log
 ```
 
 ### `migration ... is partially applied`
@@ -606,7 +626,7 @@ Tham chiếu: [`setup.php` v1.0.0-rc2](https://github.com/hashtopolis/server/blo
 
 ### Backend `BACKOFF` hoặc `spawn error`
 
-Trong 3.2.0, Supervisor chỉ quản lý Apache dài hạn; `setup.php` đã chạy xong trước đó. Vì vậy `BACKOFF` mới cần xem `backend.log`/`apache-error.log`, còn lỗi migration nằm riêng trong `migration.log`. Binary `/usr/bin/sqlx` luôn được publish và kiểm tra đúng `sqlx-cli 0.9.0` trước bước setup.
+Từ 3.2.0, Supervisor chỉ quản lý Apache dài hạn; `setup.php` đã chạy xong trước đó. Vì vậy `BACKOFF` mới cần xem `backend.log`/`apache-error.log`, còn lỗi migration nằm riêng trong `migration.log`. Binary `/usr/bin/sqlx` luôn được publish và kiểm tra đúng `sqlx-cli 0.9.0` trước bước setup.
 
 ### Cảnh báo Apache `Could not reliably determine the server's fully qualified domain name`
 
@@ -614,16 +634,16 @@ Trong 3.2.0, Supervisor chỉ quản lý Apache dài hạn; `setup.php` đã ch�
 
 ### `link: unbound variable` ở bước 06/10
 
-Lỗi này thuộc bản monolith 3.0.0, được sửa trong 3.0.1 và bản sửa tiếp tục nằm trong module `20-releases.sh` của release 3.2.0. Hàm tạo symlink cũ từng khai báo `link` rồi tham chiếu `${link}` trong cùng một lệnh `local`; với `set -u`, Bash mở rộng tham số trước khi builtin `local` hoàn tất phép gán nên script dừng tại nhánh reuse backend.
+Lỗi này thuộc bản monolith 3.0.0, được sửa trong 3.0.1 và bản sửa tiếp tục nằm trong module `20-releases.sh` của release hiện tại. Hàm tạo symlink cũ từng khai báo `link` rồi tham chiếu `${link}` trong cùng một lệnh `local`; với `set -u`, Bash mở rộng tham số trước khi builtin `local` hoàn tất phép gán nên script dừng tại nhánh reuse backend.
 
-Đảm bảo repository đã có trọn bộ 3.2.0, thay `/root/run.sh` bằng loader mới rồi chạy lại:
+Đảm bảo repository đã có trọn bộ 3.2.1, thay `/root/run.sh` bằng loader mới rồi chạy lại:
 
 ```bash
 chmod +x /root/run.sh
-/root/run.sh
+/root/run.sh deploy
 ```
 
-Không cần xóa `APP_DIR` hay build lại backend. Release đã có marker `.kiquai-ready` sẽ được tái sử dụng và script tiếp tục build frontend. Nếu muốn ép build lại cả hai release, dùng `FORCE_REBUILD=1 /root/run.sh`.
+Không cần xóa `APP_DIR` hay build lại backend. Release đã có marker `.kiquai-ready` sẽ được tái sử dụng và script tiếp tục build frontend. Nếu muốn ép build lại cả hai release, dùng `FORCE_REBUILD=1 /root/run.sh deploy`.
 
 ### Port đã bị chiếm
 
@@ -670,7 +690,7 @@ Backend launcher chỉ kiểm tra migration gate rồi start Apache; nó không 
 ### Public URL hoặc CORS sai
 
 ```bash
-PUBLIC_URL="http://YOUR_PUBLIC_IP:YOUR_EXTERNAL_PORT" /root/run.sh
+PUBLIC_URL="http://YOUR_PUBLIC_IP:YOUR_EXTERNAL_PORT" /root/run.sh deploy
 ```
 
 `PUBLIC_URL` được ghi vào frontend `assets/config.json`. Sau khi sửa, script restart Nginx/backend.

@@ -2,7 +2,7 @@
 # shellcheck shell=bash
 # KiQuai module: services
 # kiquai-module-api: 1
-# kiquai-release: 3.2.0
+# kiquai-release: 3.2.1
 
 if [[ "${KIQUAI_MODULE_CONTEXT:-0}" != "1" ]]; then
   printf 'This file is a KiQuai module; run ../run.sh instead.\n' >&2
