@@ -1,0 +1,9 @@
+# KiQuai verified module manifest
+# kiquai-module-api: 1
+# kiquai-release: 3.2.5
+aedd62b0e3ee50efc602c53c3e9832a562615ed14610e71e3b226eded3d47ca3  00-core.sh
+4708e3d525c1beb8c50e65534fbbfff51145e3ddd94decd7a5b689c61167e5b9  10-system.sh
+da86d69f9383a56e50be62eabf836444e1b4b03aea04e46de3789197d88e80c4  20-releases.sh
+4ec6a71a35825dddc39d559cd957b0adba1e8fcbc23901d42a71ddbee36300e0  30-config.sh
+b1f0ba4521dabcbfc8d4792ec7d50e18147f6d6c722eab5a6d73a63286b87447  40-services.sh
+422362d867d490b0cb0d4c710c8feee9b98f2491bd7e7d2ce8df213420ed0281  50-cli.sh
