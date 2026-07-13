@@ -2,7 +2,7 @@
 # shellcheck shell=bash
 # KiQuai module: services
 # kiquai-module-api: 1
-# kiquai-release: 3.2.1
+# kiquai-release: 3.2.2
 
 if [[ "${KIQUAI_MODULE_CONTEXT:-0}" != "1" ]]; then
   printf 'This file is a KiQuai module; run ../run.sh instead.\n' >&2
@@ -103,6 +103,38 @@ SQL
     -P "${DB_PORT}" -u "${MYSQL_USER}" -D "${MYSQL_DATABASE}" \
     -Nse 'SELECT 1' >/dev/null
   success "Local MySQL database and application account are ready."
+}
+
+configure_task_dispatch_policy() {
+  local row_count=""
+  local current_value=""
+
+  row_count="$(mysql_app_exec -Nse \
+    "SELECT COUNT(*) FROM \`Config\` WHERE \`item\` = 'priority0Start';")" \
+    || die "Unable to inspect the Hashtopolis priority-0 task assignment policy."
+  [[ "${row_count}" == "1" ]] \
+    || die "Expected exactly one Hashtopolis Config row for priority0Start, found ${row_count:-none}."
+  current_value="$(mysql_app_exec -Nse \
+    "SELECT \`value\` FROM \`Config\` WHERE \`item\` = 'priority0Start' LIMIT 1;")" \
+    || die "Unable to read the Hashtopolis priority-0 task assignment policy."
+
+  if [[ "${current_value}" != "${HASHTOPOLIS_AUTO_ASSIGN_PRIORITY_ZERO}" ]]; then
+    mysql_app_exec -e \
+      "UPDATE \`Config\` SET \`value\` = '${HASHTOPOLIS_AUTO_ASSIGN_PRIORITY_ZERO}' WHERE \`item\` = 'priority0Start';" \
+      >/dev/null \
+      || die "Unable to update the Hashtopolis priority-0 task assignment policy."
+  fi
+  current_value="$(mysql_app_exec -Nse \
+    "SELECT \`value\` FROM \`Config\` WHERE \`item\` = 'priority0Start' LIMIT 1;")" \
+    || die "Unable to verify the Hashtopolis priority-0 task assignment policy."
+  [[ "${current_value}" == "${HASHTOPOLIS_AUTO_ASSIGN_PRIORITY_ZERO}" ]] \
+    || die "Hashtopolis priority-0 task assignment policy verification failed."
+
+  if [[ "${current_value}" == "1" ]]; then
+    success "Automatic assignment is enabled for the WebUI's default priority-0 tasks."
+  else
+    warn "Automatic assignment of priority-0 tasks is disabled by configuration."
+  fi
 }
 
 mysql_app_exec() {
@@ -234,15 +266,88 @@ wait_for_legacy_backend_migration() {
   success "Legacy migration process finished; application cutover can proceed safely."
 }
 
+managed_agent_cracker_groups() {
+  local own_pgid=""
+  local proc_dir=""
+  local process_cwd=""
+  local process_arg=""
+  local process_pgid=""
+  local has_hashcat=0
+  declare -A seen_groups=()
+
+  own_pgid="$(ps -o pgid= -p "$$" 2>/dev/null | tr -d '[:space:]')"
+  for proc_dir in /proc/[0-9]*; do
+    [[ -d "${proc_dir}" ]] || continue
+    process_cwd="$(readlink -f "${proc_dir}/cwd" 2>/dev/null || true)"
+    case "${process_cwd}" in
+      "${AGENT_DIR}/crackers"|"${AGENT_DIR}/crackers/"*) ;;
+      *) continue ;;
+    esac
+    [[ -r "${proc_dir}/cmdline" ]] || continue
+    has_hashcat=0
+    while IFS= read -r -d '' process_arg; do
+      [[ "${process_arg}" == *hashcat* ]] && has_hashcat=1
+    done < "${proc_dir}/cmdline"
+    [[ "${has_hashcat}" == "1" ]] || continue
+    process_pgid="$(ps -o pgid= -p "${proc_dir##*/}" 2>/dev/null | tr -d '[:space:]')"
+    [[ "${process_pgid}" =~ ^[1-9][0-9]*$ && "${process_pgid}" != "${own_pgid}" ]] \
+      || continue
+    if [[ -z "${seen_groups[${process_pgid}]:-}" ]]; then
+      seen_groups["${process_pgid}"]=1
+      printf '%s\n' "${process_pgid}"
+    fi
+  done
+}
+
+cleanup_managed_agent_cracker_processes() {
+  local deadline=0
+  local process_pgid=""
+  local -a groups=()
+
+  mapfile -t groups < <(managed_agent_cracker_groups)
+  (( ${#groups[@]} > 0 )) || return 0
+  warn "Found ${#groups[@]} detached Hashcat process group(s) after stopping the agent; requesting TERM."
+  for process_pgid in "${groups[@]}"; do
+    kill -TERM -- "-${process_pgid}" 2>/dev/null || true
+  done
+  deadline=$((SECONDS + 15))
+  while (( SECONDS < deadline )); do
+    mapfile -t groups < <(managed_agent_cracker_groups)
+    (( ${#groups[@]} == 0 )) && {
+      success "Detached managed Hashcat processes stopped cleanly."
+      return 0
+    }
+    sleep 1
+  done
+  mapfile -t groups < <(managed_agent_cracker_groups)
+  for process_pgid in "${groups[@]}"; do
+    warn "Hashcat process group ${process_pgid} ignored TERM; sending KILL."
+    kill -KILL -- "-${process_pgid}" 2>/dev/null || true
+  done
+  sleep 1
+  mapfile -t groups < <(managed_agent_cracker_groups)
+  (( ${#groups[@]} == 0 ))
+}
+
 stop_supervisor_program_if_active() {
   local program="$1"
   local state=""
   local deadline
   local safe_deadline
-  supervisor_is_running || return 0
+  if ! supervisor_is_running; then
+    if [[ "${program}" == "agent" ]]; then
+      cleanup_managed_agent_cracker_processes \
+        || die "Detached managed Hashcat processes remained while Supervisor was offline."
+    fi
+    return 0
+  fi
   state="$(supervisor_program_state "${program}")"
   case "${state}" in
     STOPPED|EXITED|FATAL|"")
+      if [[ "${program}" == "agent" ]]; then
+        cleanup_managed_agent_cracker_processes \
+          || die "Detached managed Hashcat processes remained after the agent stopped."
+      fi
       return 0
       ;;
   esac
@@ -259,6 +364,10 @@ stop_supervisor_program_if_active() {
     done
     case "${state}" in
       STOPPED|EXITED|FATAL|"")
+        if [[ "${program}" == "agent" ]]; then
+          cleanup_managed_agent_cracker_processes \
+            || die "Detached managed Hashcat processes remained after the agent stopped."
+        fi
         return 0
         ;;
     esac
@@ -271,6 +380,10 @@ stop_supervisor_program_if_active() {
     state="$(supervisor_program_state "${program}")"
     case "${state}" in
       STOPPED|EXITED|FATAL|"")
+        if [[ "${program}" == "agent" ]]; then
+          cleanup_managed_agent_cracker_processes \
+            || die "Detached managed Hashcat processes remained after the agent stopped."
+        fi
         return 0
         ;;
     esac
@@ -281,8 +394,8 @@ stop_supervisor_program_if_active() {
 }
 
 quiesce_application_services() {
-  supervisor_is_running || return 0
   stop_supervisor_program_if_active agent
+  supervisor_is_running || return 0
   stop_supervisor_program_if_active nginx
   stop_supervisor_program_if_active backend
   rm -f "${BACKEND_READY_FILE}"
@@ -310,6 +423,89 @@ wait_for_supervisor_running() {
   return 1
 }
 
+redact_agent_log_stream() {
+  local agent_token=""
+  local agent_voucher="${AGENT_VOUCHER:-}"
+  local line=""
+
+  if [[ -r "${AGENT_DIR}/config.json" ]]; then
+    agent_token="$(jq -r '.token // empty | strings' \
+      "${AGENT_DIR}/config.json" 2>/dev/null || true)"
+    if [[ -z "${agent_voucher}" ]]; then
+      agent_voucher="$(jq -r '.voucher // empty | strings' \
+        "${AGENT_DIR}/config.json" 2>/dev/null || true)"
+    fi
+  fi
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    [[ -z "${agent_token}" ]] || line="${line//"${agent_token}"/<redacted-token>}"
+    [[ -z "${agent_voucher}" ]] || line="${line//"${agent_voucher}"/<redacted-voucher>}"
+    printf '%s\n' "${line}"
+  done
+}
+
+tail_agent_file() {
+  local label="$1"
+  local path="$2"
+  local lines="${3:-160}"
+  printf '\n===== %s =====\n' "${label}" >&2
+  if [[ ! -r "${path}" ]]; then
+    printf 'Log is not readable or does not exist: %s\n' "${path}" >&2
+    return 0
+  fi
+  tail -n "${lines}" "${path}" 2>&1 | redact_agent_log_stream
+}
+
+print_agent_lock_diagnostics() {
+  local lock_file="${AGENT_DIR}/lock.pid"
+  local lock_pid=""
+  local process_cwd=""
+  local process_arg=""
+  local has_agent_archive=0
+  local cracker_group=""
+  local cracker_group_count=0
+
+  printf '\n===== agent lock state =====\n' >&2
+  printf 'runtime_lock=%s\n' "${RUN_DIR}/agent-runtime.lock" >&2
+  while IFS= read -r cracker_group; do
+    [[ -n "${cracker_group}" ]] || continue
+    printf 'managed_hashcat_group=%s\n' "${cracker_group}" >&2
+    cracker_group_count=$((cracker_group_count + 1))
+  done < <(managed_agent_cracker_groups)
+  printf 'managed_hashcat_group_count=%s\n' "${cracker_group_count}" >&2
+  if [[ ! -e "${lock_file}" ]]; then
+    printf 'upstream_lock=absent\n' >&2
+    return 0
+  fi
+  if [[ ! -f "${lock_file}" || ! -r "${lock_file}" ]]; then
+    printf 'upstream_lock=unreadable-or-not-regular\n' >&2
+    return 0
+  fi
+  lock_pid="$(tr -d '\r\n' < "${lock_file}")"
+  printf 'upstream_lock_pid=%s\n' "${lock_pid:-empty}" >&2
+  if [[ ! "${lock_pid}" =~ ^[1-9][0-9]*$ ]] \
+      || [[ ! -d "/proc/${lock_pid}" ]] \
+      || ! kill -0 "${lock_pid}" 2>/dev/null; then
+    printf 'upstream_lock_pid_live=no\n' >&2
+    return 0
+  fi
+  printf 'upstream_lock_pid_live=yes\n' >&2
+  printf 'upstream_lock_pid_comm=' >&2
+  tr -d '\r\n' < "/proc/${lock_pid}/comm" 2>/dev/null >&2 || printf 'unavailable' >&2
+  printf '\n' >&2
+  process_cwd="$(readlink -f "/proc/${lock_pid}/cwd" 2>/dev/null || true)"
+  printf 'upstream_lock_pid_cwd=%s\n' "${process_cwd:-unavailable}" >&2
+  if [[ -r "/proc/${lock_pid}/cmdline" ]]; then
+    while IFS= read -r -d '' process_arg; do
+      case "${process_arg}" in
+        hashtopolis.zip|"${AGENT_DIR}/hashtopolis.zip")
+          has_agent_archive=1
+          ;;
+      esac
+    done < "/proc/${lock_pid}/cmdline"
+  fi
+  printf 'upstream_lock_pid_has_agent_archive=%s\n' "${has_agent_archive}" >&2
+}
+
 print_supervisor_program_diagnostics() {
   local program="$1"
   supervisor_ctl status "${program}" || true
@@ -326,6 +522,11 @@ print_supervisor_program_diagnostics() {
     nginx)
       printf '\n===== nginx-error.log =====\n' >&2
       tail -n 160 "${LOG_DIR}/nginx-error.log" 2>/dev/null || true
+      ;;
+    agent)
+      print_agent_lock_diagnostics
+      tail_agent_file agent.log "${LOG_DIR}/agent.log" 180
+      tail_agent_file agent/client.log "${AGENT_DIR}/client.log" 220
       ;;
   esac
 }
@@ -445,41 +646,104 @@ download_agent() {
   success "Installed the Hashtopolis Python agent package."
 }
 
+agent_registration_is_complete() {
+  [[ -s "${AGENT_DIR}/config.json" ]] \
+    && jq -e 'type == "object" and (.token? | type == "string" and length > 0)' \
+      "${AGENT_DIR}/config.json" >/dev/null 2>&1
+}
+
 reconcile_agent_process() {
+  local state=""
+  local output=""
+
+  if [[ "${AGENT_ENABLED}" == "1" ]] && supervisor_is_running; then
+    state="$(supervisor_program_state agent)"
+    if [[ "${state}" == "RUNNING" && -z "${AGENT_VOUCHER}" ]] \
+        && agent_registration_is_complete; then
+      info "The local GPU agent is already RUNNING; preserving its current task and deferring launcher/config changes until a deliberate service reconcile."
+      success "The local GPU agent is enabled."
+      return 0
+    fi
+  fi
+
   write_agent_launcher
   write_supervisor_config
-  supervisor_ctl reread
-  supervisor_ctl update
+  if ! output="$(supervisor_ctl reread 2>&1)"; then
+    [[ -n "${output}" ]] && printf '%s\n' "${output}" >&2
+    print_supervisor_program_diagnostics agent
+    die "Supervisor could not reread the local agent configuration."
+  fi
+  if ! output="$(supervisor_ctl update 2>&1)"; then
+    [[ -n "${output}" ]] && printf '%s\n' "${output}" >&2
+    print_supervisor_program_diagnostics agent
+    die "Supervisor could not apply the local agent configuration."
+  fi
   if [[ "${AGENT_ENABLED}" == "1" ]]; then
-    if supervisor_ctl status agent 2>/dev/null | grep -q ' RUNNING '; then
-      supervisor_ctl restart agent >/dev/null \
-        || die "Supervisor could not restart the local GPU agent."
-    else
-      supervisor_ctl start agent >/dev/null \
-        || die "Supervisor could not start the local GPU agent."
+    state="$(supervisor_program_state agent)"
+    case "${state}" in
+      RUNNING)
+        if [[ -n "${AGENT_VOUCHER}" ]] && ! agent_registration_is_complete; then
+          warn "A new voucher must replace the unregistered RUNNING attempt; stopping it before restart."
+          stop_supervisor_program_if_active agent
+          state="$(supervisor_program_state agent)"
+        else
+          info "The local GPU agent is already RUNNING; preserving its current task."
+        fi
+        ;;
+      STARTING)
+        if [[ -n "${AGENT_VOUCHER}" ]] && ! agent_registration_is_complete; then
+          warn "A new voucher must replace the unregistered STARTING attempt; stopping it before restart."
+          stop_supervisor_program_if_active agent
+          state="$(supervisor_program_state agent)"
+        else
+          info "The local GPU agent is already STARTING; waiting for stabilization."
+        fi
+        ;;
+      BACKOFF|STOPPING)
+        warn "The local GPU agent is ${state}; reconciling it before a clean start."
+        stop_supervisor_program_if_active agent
+        state="$(supervisor_program_state agent)"
+        ;;
+      STOPPED|EXITED|FATAL)
+        ;;
+      "")
+        print_supervisor_program_diagnostics agent
+        die "Supervisor returned no state for the configured local GPU agent."
+        ;;
+      *)
+        print_supervisor_program_diagnostics agent
+        die "Supervisor returned unsupported agent state '${state}'."
+        ;;
+    esac
+
+    if [[ "${state}" != "RUNNING" && "${state}" != "STARTING" ]]; then
+      if ! output="$(supervisor_ctl start agent 2>&1)"; then
+        [[ -n "${output}" ]] && printf '%s\n' "${output}" >&2
+        print_supervisor_program_diagnostics agent
+        die "Supervisor could not start the local GPU agent."
+      fi
     fi
     if ! wait_for_supervisor_running agent 90; then
       print_supervisor_program_diagnostics agent
-      tail -n 160 "${LOG_DIR}/agent.log" 2>/dev/null || true
       die "The local GPU agent did not reach RUNNING within 90 seconds."
     fi
     if [[ -n "${AGENT_VOUCHER}" ]]; then
       local deadline=$((SECONDS + 90))
-      while [[ ! -s "${AGENT_DIR}/config.json" ]] && (( SECONDS < deadline )); do
+      while ! agent_registration_is_complete && (( SECONDS < deadline )); do
         sleep 2
       done
-      if [[ -s "${AGENT_DIR}/config.json" ]]; then
+      if agent_registration_is_complete; then
         AGENT_VOUCHER=""
         write_dotenv
         success "Agent registration completed; the one-time voucher was removed from saved configuration."
       else
-        tail -n 160 "${LOG_DIR}/agent.log" 2>/dev/null || true
-        die "The agent stayed running but did not produce config.json within 90 seconds; the voucher remains saved for a deliberate retry."
+        print_supervisor_program_diagnostics agent
+        die "The agent stayed running but did not save a registration token within 90 seconds; the voucher remains saved for a deliberate retry."
       fi
     fi
     success "The local GPU agent is enabled."
   else
-    supervisor_ctl stop agent >/dev/null 2>&1 || true
+    stop_supervisor_program_if_active agent
     info "Agent is installed but not registered. Use './run.sh agent-start VOUCHER'."
   fi
 }

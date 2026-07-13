@@ -2,7 +2,7 @@
 # shellcheck shell=bash
 # KiQuai module: system
 # kiquai-module-api: 1
-# kiquai-release: 3.2.1
+# kiquai-release: 3.2.2
 
 if [[ "${KIQUAI_MODULE_CONTEXT:-0}" != "1" ]]; then
   printf 'This file is a KiQuai module; run ../run.sh instead.\n' >&2
@@ -74,7 +74,7 @@ create_policy_rcd() {
 install_packages() {
   if [[ "${SKIP_APT}" == "1" ]]; then
     local command
-    for command in apache2ctl awk composer curl df envsubst find flock git hashcat install jq mysql mysqladmin mysqld nginx openssl pgrep php python3 readlink realpath runuser sed seq sha256sum ss stat supervisorctl supervisord tar tee tr xz; do
+    for command in apache2ctl awk composer curl df envsubst find flock git hashcat install jq mysql mysqladmin mysqld nginx openssl pgrep php ps python3 readlink realpath runuser sed seq sha256sum ss stat supervisorctl supervisord tar tee tr xz; do
       have_cmd "${command}" || die "SKIP_APT=1 but '${command}' is missing."
     done
     return 0
@@ -207,6 +207,7 @@ supervisor_ctl() {
 }
 
 stop_managed_services() {
+  stop_supervisor_program_if_active agent
   if supervisor_is_running; then
     info "Stopping KiQuai Supervisor and all managed processes."
     supervisor_ctl shutdown >/dev/null 2>&1 || true

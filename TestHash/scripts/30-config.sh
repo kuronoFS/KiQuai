@@ -2,7 +2,7 @@
 # shellcheck shell=bash
 # KiQuai module: config
 # kiquai-module-api: 1
-# kiquai-release: 3.2.1
+# kiquai-release: 3.2.2
 
 if [[ "${KIQUAI_MODULE_CONTEXT:-0}" != "1" ]]; then
   printf 'This file is a KiQuai module; run ../run.sh instead.\n' >&2
@@ -286,7 +286,133 @@ set -Eeuo pipefail
 source "__RUNTIME_ENV_FILE__"
 KIQUAI_COMPONENT="agent"
 AGENT_DIR="${APP_DIR}/agent"
+AGENT_PROCESS_LOCK="${RUN_DIR}/agent-runtime.lock"
 cd "${AGENT_DIR}"
+
+# The upstream Python agent's lock.pid check only verifies that the recorded
+# PID belongs to any Python process. A PID reused by Jupyter therefore blocks
+# every Supervisor retry. This deployment-owned flock is authoritative and is
+# held across exec/agent self-update, while the upstream lock is reconciled
+# conservatively before Python starts.
+exec 6>"${AGENT_PROCESS_LOCK}"
+if ! flock -n 6; then
+  runtime_log ERROR "Another KiQuai-managed agent process holds ${AGENT_PROCESS_LOCK}."
+  exit 1
+fi
+
+reconcile_upstream_agent_lock() {
+  local lock_file="${AGENT_DIR}/lock.pid"
+  local lock_pid=""
+  local process_cwd=""
+  local agent_cwd=""
+  local process_arg=""
+  local has_agent_archive=0
+
+  [[ -e "${lock_file}" ]] || return 0
+  if [[ ! -f "${lock_file}" || ! -r "${lock_file}" ]]; then
+    runtime_log ERROR "Agent lock exists but is not a readable regular file: ${lock_file}."
+    return 1
+  fi
+  lock_pid="$(tr -d '\r\n' < "${lock_file}")"
+  if [[ ! "${lock_pid}" =~ ^[1-9][0-9]*$ ]]; then
+    runtime_log WARN "Removing malformed upstream agent lock.pid."
+    rm -f -- "${lock_file}"
+    return 0
+  fi
+  if [[ ! -d "/proc/${lock_pid}" ]] || ! kill -0 "${lock_pid}" 2>/dev/null; then
+    runtime_log WARN "Removing stale upstream agent lock.pid for exited PID ${lock_pid}."
+    rm -f -- "${lock_file}"
+    return 0
+  fi
+  if ! process_cwd="$(readlink -f "/proc/${lock_pid}/cwd" 2>/dev/null)" \
+      || [[ -z "${process_cwd}" ]]; then
+    runtime_log ERROR "PID ${lock_pid} is alive but its working directory cannot be verified; refusing to remove lock.pid."
+    return 1
+  fi
+  [[ -r "/proc/${lock_pid}/cmdline" ]] || {
+    runtime_log ERROR "PID ${lock_pid} is alive but its command line cannot be verified; refusing to remove lock.pid."
+    return 1
+  }
+  while IFS= read -r -d '' process_arg; do
+    case "${process_arg}" in
+      hashtopolis.zip|"${AGENT_DIR}/hashtopolis.zip")
+        has_agent_archive=1
+        ;;
+    esac
+  done < "/proc/${lock_pid}/cmdline"
+  agent_cwd="$(readlink -f "${AGENT_DIR}")"
+  if [[ "${process_cwd}" == "${agent_cwd}" && "${has_agent_archive}" == "1" ]]; then
+    runtime_log ERROR "A live Hashtopolis agent already owns lock.pid (pid=${lock_pid}); refusing to create a duplicate."
+    return 1
+  fi
+  runtime_log WARN "Removing lock.pid whose live PID ${lock_pid} belongs to an unrelated process."
+  rm -f -- "${lock_file}"
+}
+
+managed_agent_cracker_groups() {
+  local own_pgid=""
+  local proc_dir=""
+  local process_cwd=""
+  local process_arg=""
+  local process_pgid=""
+  local has_hashcat=0
+  declare -A seen_groups=()
+
+  own_pgid="$(ps -o pgid= -p "$$" 2>/dev/null | tr -d '[:space:]')"
+  for proc_dir in /proc/[0-9]*; do
+    [[ -d "${proc_dir}" ]] || continue
+    process_cwd="$(readlink -f "${proc_dir}/cwd" 2>/dev/null || true)"
+    case "${process_cwd}" in
+      "${AGENT_DIR}/crackers"|"${AGENT_DIR}/crackers/"*) ;;
+      *) continue ;;
+    esac
+    [[ -r "${proc_dir}/cmdline" ]] || continue
+    has_hashcat=0
+    while IFS= read -r -d '' process_arg; do
+      [[ "${process_arg}" == *hashcat* ]] && has_hashcat=1
+    done < "${proc_dir}/cmdline"
+    [[ "${has_hashcat}" == "1" ]] || continue
+    process_pgid="$(ps -o pgid= -p "${proc_dir##*/}" 2>/dev/null | tr -d '[:space:]')"
+    [[ "${process_pgid}" =~ ^[1-9][0-9]*$ && "${process_pgid}" != "${own_pgid}" ]] \
+      || continue
+    if [[ -z "${seen_groups[${process_pgid}]:-}" ]]; then
+      seen_groups["${process_pgid}"]=1
+      printf '%s\n' "${process_pgid}"
+    fi
+  done
+}
+
+cleanup_orphan_agent_crackers() {
+  local deadline=0
+  local process_pgid=""
+  local any_live=0
+  local -a groups=()
+
+  mapfile -t groups < <(managed_agent_cracker_groups)
+  (( ${#groups[@]} > 0 )) || return 0
+  runtime_log WARN "Found ${#groups[@]} orphan Hashcat process group(s) in the managed agent cracker directory; requesting TERM before agent start."
+  for process_pgid in "${groups[@]}"; do
+    kill -TERM -- "-${process_pgid}" 2>/dev/null || true
+  done
+  deadline=$((SECONDS + 15))
+  while (( SECONDS < deadline )); do
+    mapfile -t groups < <(managed_agent_cracker_groups)
+    (( ${#groups[@]} == 0 )) && return 0
+    sleep 1
+  done
+  mapfile -t groups < <(managed_agent_cracker_groups)
+  for process_pgid in "${groups[@]}"; do
+    runtime_log WARN "Hashcat process group ${process_pgid} ignored TERM; sending KILL."
+    kill -KILL -- "-${process_pgid}" 2>/dev/null || true
+  done
+  sleep 1
+  mapfile -t groups < <(managed_agent_cracker_groups)
+  any_live=${#groups[@]}
+  (( any_live == 0 )) || {
+    runtime_log ERROR "Unable to terminate ${any_live} orphan managed Hashcat process group(s)."
+    return 1
+  }
+}
 
 for _attempt in $(seq 1 150); do
   [[ -f "${AGENT_DIR}/hashtopolis.zip" ]] && break
@@ -297,6 +423,9 @@ for _attempt in $(seq 1 150); do
   sleep 2
 done
 
+reconcile_upstream_agent_lock
+cleanup_orphan_agent_crackers
+
 args=(
   python3 "${AGENT_DIR}/hashtopolis.zip"
   --url "http://127.0.0.1:${INTERNAL_PORT}/api/server.php"
@@ -306,9 +435,15 @@ args=(
   --preprocessors-path "${AGENT_DIR}/preprocessors"
   --zaps-path "${AGENT_DIR}/zaps"
 )
-if [[ ! -s "${AGENT_DIR}/config.json" ]]; then
+if [[ -e "${AGENT_DIR}/config.json" ]] \
+    && ! jq -e 'type == "object"' "${AGENT_DIR}/config.json" >/dev/null 2>&1; then
+  runtime_log ERROR "Agent config.json is not valid JSON; preserve it for inspection, then repair or remove it before re-registration."
+  exit 1
+fi
+if ! jq -e '(.token? | type == "string" and length > 0)' \
+    "${AGENT_DIR}/config.json" >/dev/null 2>&1; then
   [[ -n "${AGENT_VOUCHER}" ]] || {
-    runtime_log ERROR "No agent config or AGENT_VOUCHER is available."
+    runtime_log ERROR "No completed agent registration token or AGENT_VOUCHER is available."
     exit 1
   }
   args+=(--voucher "${AGENT_VOUCHER}")
@@ -398,6 +533,7 @@ stdout_logfile_backups=3
 command=/bin/bash ${CONFIG_DIR}/start-agent.sh
 directory=${AGENT_DIR}
 user=root
+environment=PYTHONUNBUFFERED="1"
 priority=40
 autostart=false
 autorestart=unexpected
@@ -405,7 +541,7 @@ startsecs=10
 startretries=3
 stopasgroup=true
 killasgroup=true
-stopsignal=TERM
+stopsignal=INT
 stopwaitsecs=30
 redirect_stderr=true
 stdout_logfile=${LOG_DIR}/agent.log

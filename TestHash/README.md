@@ -1,6 +1,6 @@
 # KiQuai Hashtopolis + Hashcat trên Vast.ai
 
-KiQuai triển khai toàn bộ stack trực tiếp trong **một CUDA container gốc của Vast.ai**. `run.sh` 3.2.1 chỉ là loader nhỏ: tải manifest và sáu module, kiểm tra từng file rồi mới nạp logic triển khai. Stack không cài Docker Engine, không khởi động `dockerd`, không dùng Docker Compose, không tạo nested container, bridge network hay `socat`.
+KiQuai triển khai toàn bộ stack trực tiếp trong **một CUDA container gốc của Vast.ai**. `run.sh` 3.2.2 chỉ là loader nhỏ: tải manifest và sáu module, kiểm tra từng file rồi mới nạp logic triển khai. Stack không cài Docker Engine, không khởi động `dockerd`, không dùng Docker Compose, không tạo nested container, bridge network hay `socat`.
 
 Các process MySQL, Apache/PHP, Nginx và Hashtopolis Python Agent được quản lý bởi một `supervisord` riêng. Hashcat chạy trực tiếp trong cùng container để sử dụng GPU NVIDIA do Vast.ai gắn vào container đó.
 
@@ -38,7 +38,7 @@ flowchart LR
     Run["run.sh loader"] --> Manifest["scripts/manifest.sha256"]
     Manifest --> Download["Tải 6 module"]
     Download --> Verify["Release/API + SHA-256 + bash -n"]
-    Verify --> Cache["Atomic cache APP_DIR/bootstrap/3.2.1"]
+    Verify --> Cache["Atomic cache APP_DIR/bootstrap/3.2.2"]
     Offline["Mạng lỗi / lệnh cứu hộ"] --> Cache
     Cache --> Source["Source theo thứ tự"]
     Source --> Deploy["main → 10 deployment stages"]
@@ -71,7 +71,7 @@ TestHash/
 | `40-services.sh` | MySQL provisioning, one-shot migration, HTTP contract check và Python agent |
 | `50-cli.sh` | Diagnostics, command dispatch và 10 deployment stages |
 
-Loader không source một module nếu thiếu file, sai checksum, sai module API/release hoặc không qua `bash -n`. Module đã xác minh được publish nguyên thư mục dưới lock tại `APP_DIR/bootstrap/3.2.1/`. Các lệnh vận hành như `status`, `logs`, `diagnostics`, `stop` và `help` ưu tiên cache đã xác minh nên vẫn dùng được khi GitHub tạm thời mất kết nối.
+Loader không source một module nếu thiếu file, sai checksum, sai module API/release hoặc không qua `bash -n`. Module đã xác minh được publish nguyên thư mục dưới lock tại `APP_DIR/bootstrap/3.2.2/`. Các lệnh vận hành như `status`, `logs`, `diagnostics`, `stop` và `help` ưu tiên cache đã xác minh nên vẫn dùng được khi GitHub tạm thời mất kết nối.
 
 ## Trạng thái hỗ trợ upstream
 
@@ -86,7 +86,7 @@ Phiên bản mặc định:
 
 | Component | Phiên bản |
 |---|---|
-| Bootstrap/module release | `3.2.1` |
+| Bootstrap/module release | `3.2.2` |
 | Hashtopolis backend | `v1.0.0-rc2` |
 | Hashtopolis frontend | `v1.0.0-rc2` |
 | Python agent | Bản do backend cung cấp tại `agents.php?download=1` |
@@ -139,7 +139,7 @@ INTERNAL_PORT=18000 ./run.sh deploy
 
 ## 2. Download và chạy
 
-> Phải push `run.sh`, `README.md`, `scripts/manifest.sha256` và cả sáu module trong **cùng một commit** trước khi dùng URL GitHub. Nhánh `main` phải thực sự chứa trọn release 3.2.1.
+> Phải push `run.sh`, `README.md`, `scripts/manifest.sha256` và cả sáu module trong **cùng một commit** trước khi dùng URL GitHub. Nhánh `main` phải thực sự chứa trọn release 3.2.2.
 
 Nếu image đã có `curl`, one-liner cho trường **On-start Script** là:
 
@@ -176,7 +176,7 @@ Regression test không cần GPU/MySQL/service thật:
 bash tests/test-shell.sh
 ```
 
-Test kiểm tra `bash -n`, manifest SHA-256, source module dưới `set -u`, generated launcher, Supervisor autostart policy, re-derive `PUBLIC_URL`, failed-migration guard, HTTP contract, thứ tự deploy, lifecycle `serve`, operation lock và cache loader khi offline.
+Test kiểm tra `bash -n`, manifest SHA-256, source module dưới `set -u`, generated launcher, stale/live agent lock, registration token, credential redaction, detached Hashcat cleanup, Supervisor state machine và log lỗi spawn, policy tự gán task priority `0`, re-derive `PUBLIC_URL`, failed-migration guard, HTTP contract, thứ tự deploy, lifecycle `serve`, operation lock và cache loader khi offline.
 
 Preflight:
 
@@ -332,12 +332,12 @@ Hashtopolis có thể yêu cầu agent tải một Hashcat package riêng cho ta
 | `KIQUAI_REPOSITORY` | `kuronoFS/KiQuai` | Repository chứa `TestHash/` |
 | `KIQUAI_REF` | `refs/heads/main` | Branch, tag hoặc full commit SHA dùng cho manifest và module |
 | `KIQUAI_BASE_URL` | Raw GitHub URL suy ra từ repo/ref | Override nguồn tải; hỗ trợ HTTPS và `file://` để kiểm thử |
-| `KIQUAI_MODULE_DIR` | `APP_DIR/bootstrap/3.2.1` | Cache chỉ chứa module đã xác minh |
+| `KIQUAI_MODULE_DIR` | `APP_DIR/bootstrap/3.2.2` | Cache chỉ chứa module đã xác minh |
 | `KIQUAI_LOADER_LOG` | `LOG_DIR/loader.log` | Log tải, checksum, syntax check và source module |
 | `KIQUAI_REFRESH_MODULES` | `0` | Đặt `1` để buộc lệnh vận hành thử refresh module thay vì ưu tiên cache |
 | `KIQUAI_REQUIRE_FRESH_MODULES` | `0` | Đặt `1` để cấm fallback cache nếu tải mạng thất bại |
 
-Loader yêu cầu `run.sh`, manifest và module có cùng release `3.2.1` và module API `1`. Không trộn file từ hai commit hoặc tự sửa module mà quên cập nhật manifest.
+Loader yêu cầu `run.sh`, manifest và module có cùng release `3.2.2` và module API `1`. Không trộn file từ hai commit hoặc tự sửa module mà quên cập nhật manifest.
 
 `deploy`/`restart` thử tải bộ module mới trước rồi fallback sang cache đã xác minh nếu lỗi mạng. `verify-modules` luôn yêu cầu tải thành công; các lệnh cứu hộ ưu tiên cache để không bị GitHub chặn việc debug hoặc stop service.
 
@@ -388,6 +388,7 @@ Riêng khi caller truyền `PUBLIC_URL` mới, script tự tính lại `HASHTOPO
 | `AGENT_ENABLED` | `0` | Tự chạy local agent |
 | `AGENT_VOUCHER` | rỗng | Voucher đăng ký một lần |
 | `AGENT_DOWNLOAD_URL` | Local `agents.php?download=1` | Override nguồn agent ZIP |
+| `HASHTOPOLIS_AUTO_ASSIGN_PRIORITY_ZERO` | `1` | Cho phép agent tự nhận task priority `0` do WebUI tạo mặc định |
 | `REQUIRE_HASHCAT_GPU` | `1` | Dừng nếu Hashcat không phát hiện device |
 | `SKIP_APT` | `0` | Không chạy APT; dependency phải tồn tại |
 | `FORCE_REBUILD` | `0` | Build lại release dù tag đã có |
@@ -523,6 +524,7 @@ MySQL data trong inner Docker volume **không tương thích bằng cách copy t
 | `apache-error.log` | PHP/Apache errors |
 | `nginx-error.log` | Nginx errors |
 | `agent.log` | Python agent và Hashcat task output |
+| `APP_DIR/agent/client.log` | Log riêng của agent upstream; `logs`/`diagnostics` tail có redact token |
 | `hashcat-devices.log` | Kết quả `hashcat -I` |
 | `diagnostics/` | Snapshot chẩn đoán đã redact secret |
 
@@ -564,7 +566,7 @@ cd TestHash/scripts
 {
   printf '%s\n' '# KiQuai verified module manifest' \
     '# kiquai-module-api: 1' \
-    '# kiquai-release: 3.2.1'
+    '# kiquai-release: 3.2.2'
   sha256sum 00-core.sh 10-system.sh 20-releases.sh \
     30-config.sh 40-services.sh 50-cli.sh
 } > manifest.sha256
@@ -575,7 +577,7 @@ for file in ./*.sh ../run.sh; do bash -n "$file"; done
 
 Nếu `mysql`, `backend` và `nginx` đều `RUNNING`, HTTP contract đã pass, rồi log lập tức in lại banner `== CUDA ==` và chạy lại `apt-get`, đó là **outer container startup mới**, không phải Supervisor child crash. Nguyên nhân thường gặp là dùng `/root/run.sh deploy` hoặc `/root/run.sh` làm Docker workload/entrypoint: deploy trả exit `0`, PID chính kết thúc và nền tảng đưa instance mong muốn ở trạng thái running lên lại.
 
-Release 3.2.1 cung cấp lifecycle đúng cho trường hợp này:
+Release 3.2.2 tiếp tục dùng lifecycle foreground được giới thiệu ở 3.2.1:
 
 ```bash
 exec /root/run.sh serve
@@ -636,7 +638,7 @@ Từ 3.2.0, Supervisor chỉ quản lý Apache dài hạn; `setup.php` đã ch�
 
 Lỗi này thuộc bản monolith 3.0.0, được sửa trong 3.0.1 và bản sửa tiếp tục nằm trong module `20-releases.sh` của release hiện tại. Hàm tạo symlink cũ từng khai báo `link` rồi tham chiếu `${link}` trong cùng một lệnh `local`; với `set -u`, Bash mở rộng tham số trước khi builtin `local` hoàn tất phép gán nên script dừng tại nhánh reuse backend.
 
-Đảm bảo repository đã có trọn bộ 3.2.1, thay `/root/run.sh` bằng loader mới rồi chạy lại:
+Đảm bảo repository đã có trọn bộ 3.2.2, thay `/root/run.sh` bằng loader mới rồi chạy lại:
 
 ```bash
 chmod +x /root/run.sh
@@ -695,11 +697,11 @@ PUBLIC_URL="http://YOUR_PUBLIC_IP:YOUR_EXTERNAL_PORT" /root/run.sh deploy
 
 `PUBLIC_URL` được ghi vào frontend `assets/config.json`. Sau khi sửa, script restart Nginx/backend.
 
-### Agent không đăng ký
+### Agent không đăng ký, không chạy hoặc không tự nhận task
 
 ```bash
 /root/run.sh status
-tail -n 250 /var/log/kiquai-hashtopolis/agent.log
+/root/run.sh logs
 ```
 
 Voucher là one-time token. Nếu voucher đã dùng hoặc hết hạn, tạo voucher mới rồi chạy:
@@ -707,6 +709,10 @@ Voucher là one-time token. Nếu voucher đã dùng hoặc hết hạn, tạo v
 ```bash
 /root/run.sh agent-start NEW_VOUCHER
 ```
+
+Agent upstream 0.7.4 để lại `agent/lock.pid` khi bị `SIGTERM` hoặc exception và có thể nhận nhầm PID Python/Jupyter đã tái sử dụng là một agent khác. Release 3.2.2 dùng `RUN_DIR/agent-runtime.lock` làm khóa chính, kiểm tra cả CWD lẫn đối số `hashtopolis.zip` trước khi dọn lock upstream, và dùng `SIGINT` để agent tự cleanup. Script chỉ coi đăng ký hoàn tất khi `config.json` là JSON hợp lệ và có token không rỗng; voucher không bị xóa khi agent mới chỉ tạo file `{}`. Vì Hashcat upstream tách process group bằng `setsid`, các đường stop/start còn phát hiện và dọn riêng Hashcat orphan bên dưới `agent/crackers/`. Nếu `supervisorctl start` thất bại, lệnh in ngay trạng thái lock/process group, `agent.log` và `agent/client.log` đã redact trước khi dừng.
+
+WebUI v1.0.0-rc2 tạo task mới với priority `0`, trong khi backend mặc định không tự gán priority `0`. KiQuai 3.2.2 đặt `priority0Start=1` khi deploy hoặc `agent-start`; đặt `HASHTOPOLIS_AUTO_ASSIGN_PRIORITY_ZERO=0` nếu muốn giữ hành vi upstream. Một task vẫn chỉ phù hợp khi agent đang **Active**, cùng access group với task/hashlist/file, loại CPU/GPU khớp, task chưa archived/hoàn tất và chưa chạm `Max agents`.
 
 ### `hashcat -I` không thấy GPU
 

@@ -2,7 +2,7 @@
 # shellcheck shell=bash
 # KiQuai module: cli
 # kiquai-module-api: 1
-# kiquai-release: 3.2.1
+# kiquai-release: 3.2.2
 
 if [[ "${KIQUAI_MODULE_CONTEXT:-0}" != "1" ]]; then
   printf 'This file is a KiQuai module; run ../run.sh instead.\n' >&2
@@ -92,12 +92,39 @@ collect_diagnostics() {
     printf '\n===== HTTP =====\n'
     curl -sS -D - -o /dev/null --max-time 8 \
       "http://127.0.0.1:${INTERNAL_PORT}/" 2>&1 || true
+    printf '\n===== Agent lock and dispatch state =====\n'
+    print_agent_lock_diagnostics
+    mysql_app_exec -e \
+      "SELECT item, value FROM \`Config\` WHERE item = 'priority0Start';" 2>&1 || true
+    mysql_app_exec -e \
+      "SELECT agentId, agentName, isActive, cpuOnly, lastAct, lastTime FROM \`Agent\` ORDER BY agentId;" \
+      2>&1 || true
+    mysql_app_exec -e \
+      "SELECT assignmentId, taskId, agentId FROM \`Assignment\` ORDER BY assignmentId;" \
+      2>&1 || true
+    mysql_app_exec -e \
+      "SELECT accessGroupAgentId, accessGroupId, agentId FROM \`AccessGroupAgent\` ORDER BY accessGroupAgentId;" \
+      2>&1 || true
+    mysql_app_exec -e \
+      "SELECT taskWrapperId, priority, maxAgents, taskType, hashlistId, accessGroupId, isArchived FROM \`TaskWrapper\` ORDER BY taskWrapperId DESC LIMIT 30;" \
+      2>&1 || true
+    mysql_app_exec -e \
+      "SELECT hashlistId, hashlistName, hashTypeId, hashCount, cracked, isSecret, accessGroupId, isArchived FROM \`Hashlist\` ORDER BY hashlistId DESC LIMIT 30;" \
+      2>&1 || true
+    mysql_app_exec -e \
+      "SELECT ft.taskId, f.fileId, f.filename, f.isSecret, f.accessGroupId FROM \`FileTask\` ft JOIN \`File\` f ON f.fileId = ft.fileId ORDER BY ft.taskId DESC LIMIT 60;" \
+      2>&1 || true
+    mysql_app_exec -e \
+      "SELECT taskId, taskName, priority, isCpuTask, isArchived, crackerBinaryId FROM \`Task\` ORDER BY taskId DESC LIMIT 30;" \
+      2>&1 || true
     printf '\n===== Bounded logs =====\n'
     local log
-    for log in migration.log mysql.log mysql-supervisor.log backend.log apache-error.log nginx-error.log nginx-supervisor.log agent.log supervisord.log bootstrap.log loader.log; do
+    for log in migration.log mysql.log mysql-supervisor.log backend.log apache-error.log nginx-error.log nginx-supervisor.log supervisord.log bootstrap.log loader.log; do
       printf '\n--- %s ---\n' "${log}"
       tail -n 160 "${LOG_DIR}/${log}" 2>&1 || true
     done
+    tail_agent_file agent.log "${LOG_DIR}/agent.log" 180
+    tail_agent_file agent/client.log "${AGENT_DIR}/client.log" 220
   } > "${LAST_DIAGNOSTIC_FILE}" 2>&1
   chmod 600 "${LAST_DIAGNOSTIC_FILE}"
 }
@@ -113,6 +140,7 @@ Configuration summary (secrets redacted):
   BACKEND_VERSION     ${HASHTOPOLIS_VERSION}
   FRONTEND_VERSION    ${HASHTOPOLIS_FRONTEND_VERSION}
   AGENT_ENABLED       ${AGENT_ENABLED}
+  AUTO_ASSIGN_TASKS   ${HASHTOPOLIS_AUTO_ASSIGN_PRIORITY_ZERO} (priority 0)
   MAIN_LOG            ${MAIN_LOG}
 EOF
 }
@@ -156,8 +184,8 @@ print_success() {
     state="$(supervisor_program_state agent)"
     [[ "${state}" == "RUNNING" ]] \
       || die "AGENT_ENABLED=1 but Supervisor program 'agent' is ${state:-unknown}, not RUNNING."
-    [[ -s "${AGENT_DIR}/config.json" ]] \
-      || die "AGENT_ENABLED=1 but the local agent has no completed config.json registration."
+    agent_registration_is_complete \
+      || die "AGENT_ENABLED=1 but the local agent has no completed registration token."
   fi
   supervisor_ctl status || true
   printf '\n%s' "${C_GREEN}"
@@ -220,6 +248,7 @@ Common overrides:
   FORCE_REBUILD=1 ./run.sh deploy
   WIPE_DATA=1 ./run.sh deploy
   REQUIRE_HASHCAT_GPU=0 ./run.sh deploy
+  HASHTOPOLIS_AUTO_ASSIGN_PRIORITY_ZERO=0 ./run.sh deploy
 EOF
 }
 
@@ -234,6 +263,7 @@ command_status() {
   local failed_rows=""
   local program=""
   local state=""
+  local priority_zero_policy=""
   if supervisor_is_running; then
     supervisor_ctl status || true
     for program in mysql backend nginx; do
@@ -247,6 +277,10 @@ command_status() {
       state="$(supervisor_program_state agent)"
       if [[ "${state}" != "RUNNING" ]]; then
         error "AGENT_ENABLED=1 but the agent is ${state:-unknown}."
+        failed=1
+      fi
+      if ! agent_registration_is_complete; then
+        error "AGENT_ENABLED=1 but config.json has no completed registration token."
         failed=1
       fi
     fi
@@ -263,6 +297,14 @@ command_status() {
   if MYSQL_PWD="${MYSQL_PASSWORD}" mysql --protocol=tcp -h 127.0.0.1 \
       -P "${DB_PORT}" -u "${MYSQL_USER}" -Nse 'SELECT 1' >/dev/null 2>&1; then
     success "Database login passed."
+    priority_zero_policy="$(mysql_app_exec -Nse \
+      "SELECT \`value\` FROM \`Config\` WHERE \`item\` = 'priority0Start' LIMIT 1;" \
+      2>/dev/null || true)"
+    if [[ "${priority_zero_policy}" == "1" ]]; then
+      success "Automatic assignment is enabled for priority-0 tasks."
+    else
+      warn "Automatic assignment is not enabled for priority-0 tasks (value=${priority_zero_policy:-missing})."
+    fi
     if ! failed_rows="$(failed_migration_rows 2>/dev/null)"; then
       error "Database login passed but SQLx migration state could not be inspected."
       failed=1
@@ -314,11 +356,14 @@ command_credentials() {
 command_logs() {
   require_existing_installation
   supervisor_is_running && supervisor_ctl status || true
+  print_agent_lock_diagnostics
   local log
-  for log in migration.log mysql.log mysql-supervisor.log backend.log apache-error.log nginx-error.log nginx-supervisor.log agent.log supervisord.log bootstrap.log loader.log; do
+  for log in migration.log mysql.log mysql-supervisor.log backend.log apache-error.log nginx-error.log nginx-supervisor.log supervisord.log bootstrap.log loader.log; do
     printf '\n===== %s =====\n' "${log}"
     tail -n 220 "${LOG_DIR}/${log}" 2>/dev/null || true
   done
+  tail_agent_file agent.log "${LOG_DIR}/agent.log" 220
+  tail_agent_file agent/client.log "${AGENT_DIR}/client.log" 260
 }
 
 command_diagnostics() {
@@ -421,9 +466,14 @@ command_agent_start() {
   require_existing_installation
   acquire_lock
   if [[ -n "${voucher}" ]]; then
-    AGENT_VOUCHER="${voucher}"
+    if agent_registration_is_complete; then
+      warn "An existing agent registration is present; the supplied voucher is ignored. Remove config.json only when intentionally re-registering this agent."
+      AGENT_VOUCHER=""
+    else
+      AGENT_VOUCHER="${voucher}"
+    fi
   fi
-  if [[ ! -s "${AGENT_DIR}/config.json" && -z "${AGENT_VOUCHER}" ]]; then
+  if ! agent_registration_is_complete && [[ -z "${AGENT_VOUCHER}" ]]; then
     die "Provide a voucher: ./run.sh agent-start YOUR_VOUCHER"
   fi
   AGENT_ENABLED=1
@@ -442,20 +492,28 @@ command_agent_start() {
     start_web_services_after_migration
   fi
   wait_for_http
+  configure_task_dispatch_policy
   download_agent
   reconcile_agent_process
 }
 
 command_agent_stop() {
+  local output=""
   require_existing_installation
   acquire_lock
   AGENT_ENABLED=0
   write_dotenv
+  stop_supervisor_program_if_active agent
   if supervisor_is_running; then
-    supervisor_ctl stop agent >/dev/null 2>&1 || true
     write_supervisor_config
-    supervisor_ctl reread
-    supervisor_ctl update
+    if ! output="$(supervisor_ctl reread 2>&1)"; then
+      [[ -n "${output}" ]] && printf '%s\n' "${output}" >&2
+      die "Supervisor could not reread the disabled agent configuration."
+    fi
+    if ! output="$(supervisor_ctl update 2>&1)"; then
+      [[ -n "${output}" ]] && printf '%s\n' "${output}" >&2
+      die "Supervisor could not apply the disabled agent configuration."
+    fi
   fi
   success "The local agent is stopped and disabled; its registration data was preserved."
 }
@@ -464,8 +522,9 @@ deploy() {
   acquire_lock
   print_header
 
-  if [[ "${AGENT_ENABLED}" == "1" && -z "${AGENT_VOUCHER}" && ! -s "${AGENT_DIR}/config.json" ]]; then
-    die "AGENT_ENABLED=1 requires AGENT_VOUCHER unless an existing agent/config.json is present."
+  if [[ "${AGENT_ENABLED}" == "1" && -z "${AGENT_VOUCHER}" ]] \
+      && ! agent_registration_is_complete; then
+    die "AGENT_ENABLED=1 requires AGENT_VOUCHER unless config.json contains a completed registration token."
   fi
 
   begin_step "Preflight: root, disk, and NVIDIA GPU"
@@ -516,6 +575,7 @@ deploy() {
   wait_for_mysql
   provision_database
   run_backend_setup
+  configure_task_dispatch_policy
   start_web_services_after_migration
   end_step
 

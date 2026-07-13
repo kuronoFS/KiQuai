@@ -2,7 +2,7 @@
 # shellcheck shell=bash
 # KiQuai module: core
 # kiquai-module-api: 1
-# kiquai-release: 3.2.1
+# kiquai-release: 3.2.2
 
 set -Eeuo pipefail
 shopt -s inherit_errexit 2>/dev/null || true
@@ -25,7 +25,7 @@ fi
 # This script intentionally does not install or start Docker, dockerd, Compose,
 # containerd, a nested network namespace, or a socat port forwarder.
 
-readonly SCRIPT_VERSION="3.2.1"
+readonly SCRIPT_VERSION="3.2.2"
 readonly SCRIPT_NAME="KiQuai Hashtopolis modular single-container bootstrap"
 readonly TOTAL_STEPS=10
 readonly SQLX_CLI_VERSION="0.9.0"
@@ -42,7 +42,8 @@ for _name in \
   MYSQL_ROOT_PASS MYSQL_DATABASE MYSQL_USER MYSQL_PASSWORD \
   HASHTOPOLIS_ADMIN_USER HASHTOPOLIS_ADMIN_PASSWORD \
   HASHTOPOLIS_BACKEND_URL HASHTOPOLIS_FRONTEND_PORT \
-  AGENT_ENABLED AGENT_VOUCHER AGENT_DOWNLOAD_URL REQUIRE_HASHCAT_GPU; do
+  AGENT_ENABLED AGENT_VOUCHER AGENT_DOWNLOAD_URL \
+  HASHTOPOLIS_AUTO_ASSIGN_PRIORITY_ZERO REQUIRE_HASHCAT_GPU; do
   if [[ -v ${_name} ]]; then
     CALLER_SET["${_name}"]=1
   else
@@ -79,6 +80,7 @@ HASHTOPOLIS_FRONTEND_PORT="${HASHTOPOLIS_FRONTEND_PORT-}"
 AGENT_ENABLED="${AGENT_ENABLED-}"
 AGENT_VOUCHER="${AGENT_VOUCHER-}"
 AGENT_DOWNLOAD_URL="${AGENT_DOWNLOAD_URL-}"
+HASHTOPOLIS_AUTO_ASSIGN_PRIORITY_ZERO="${HASHTOPOLIS_AUTO_ASSIGN_PRIORITY_ZERO-}"
 
 WIPE_DATA="${WIPE_DATA:-0}"
 FORCE_REBUILD="${FORCE_REBUILD:-0}"
@@ -455,7 +457,8 @@ load_saved_config() {
     MYSQL_ROOT_PASS MYSQL_DATABASE MYSQL_USER MYSQL_PASSWORD \
     HASHTOPOLIS_ADMIN_USER HASHTOPOLIS_ADMIN_PASSWORD \
     HASHTOPOLIS_BACKEND_URL HASHTOPOLIS_FRONTEND_PORT \
-    AGENT_ENABLED AGENT_VOUCHER AGENT_DOWNLOAD_URL REQUIRE_HASHCAT_GPU; do
+    AGENT_ENABLED AGENT_VOUCHER AGENT_DOWNLOAD_URL \
+    HASHTOPOLIS_AUTO_ASSIGN_PRIORITY_ZERO REQUIRE_HASHCAT_GPU; do
     if [[ "${CALLER_SET[${name}]:-0}" == "0" ]]; then
       saved="$(dotenv_get "${name}" "${APP_DIR}/.env" 2>/dev/null || true)"
       if [[ -n "${saved}" ]]; then
@@ -479,6 +482,7 @@ apply_defaults() {
   HASHTOPOLIS_ADMIN_USER="${HASHTOPOLIS_ADMIN_USER:-admin}"
   AGENT_ENABLED="${AGENT_ENABLED:-0}"
   AGENT_DOWNLOAD_URL="${AGENT_DOWNLOAD_URL-}"
+  HASHTOPOLIS_AUTO_ASSIGN_PRIORITY_ZERO="${HASHTOPOLIS_AUTO_ASSIGN_PRIORITY_ZERO:-1}"
 
   ENV_FILE="${APP_DIR}/.env"
   CONFIG_DIR="${APP_DIR}/config"
@@ -582,6 +586,7 @@ validate_config() {
   validate_bool KEEP_BUILD_TOOLCHAINS "${KEEP_BUILD_TOOLCHAINS}"
   validate_bool DIAGNOSTICS_ON_FAILURE "${DIAGNOSTICS_ON_FAILURE}"
   validate_bool AGENT_ENABLED "${AGENT_ENABLED}"
+  validate_bool HASHTOPOLIS_AUTO_ASSIGN_PRIORITY_ZERO "${HASHTOPOLIS_AUTO_ASSIGN_PRIORITY_ZERO}"
 
   is_uint "${MIN_FREE_GB}" || die "MIN_FREE_GB must be a non-negative integer."
   [[ "${HASHTOPOLIS_VERSION}" =~ ^v[A-Za-z0-9._-]+$ ]] \
@@ -648,6 +653,7 @@ write_dotenv() {
   write_env_line AGENT_ENABLED "${AGENT_ENABLED}" "${temp}"
   write_env_line AGENT_VOUCHER "${AGENT_VOUCHER}" "${temp}"
   write_env_line AGENT_DOWNLOAD_URL "${AGENT_DOWNLOAD_URL}" "${temp}"
+  write_env_line HASHTOPOLIS_AUTO_ASSIGN_PRIORITY_ZERO "${HASHTOPOLIS_AUTO_ASSIGN_PRIORITY_ZERO}" "${temp}"
   write_env_line REQUIRE_HASHCAT_GPU "${REQUIRE_HASHCAT_GPU}" "${temp}"
   chmod 600 "${temp}"
   mv -f "${temp}" "${ENV_FILE}"
